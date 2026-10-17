@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Retake</title>
+  <desc>An open clapperboard whose slate carries a circular retake arrow, cut out of a single colour.</desc>
+  <defs>
+    <mask id="flap">
+      <rect width="256" height="256" fill="#fff"/>
+      <g fill="#000">
+        <path d="M62 64h22l-15 36H47z"/>
+        <path d="M108 64h22l-15 36H93z"/>
+        <path d="M154 64h22l-15 36h-22z"/>
+        <path d="M200 64h22l-15 36h-22z"/>
+      </g>
+    </mask>
+    <mask id="slate">
+      <rect width="256" height="256" fill="#fff"/>
+      <path d="M145 136.6A34 34 0 1 1 119.2 133.2" fill="none" stroke="#000" stroke-width="14" stroke-linecap="round"/>
+      <path d="M137.5 128.3 112.6 118.2 116.6 149.9z" fill="#000" stroke="#000" stroke-width="5" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <g fill="currentColor">
+    <rect x="30" y="64" width="196" height="36" rx="8" transform="rotate(-12 30 100)" mask="url(#flap)"/>
+    <rect x="28" y="106" width="200" height="122" rx="20" mask="url(#slate)"/>
+  </g>
+</svg>

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Build and install Retake as a pacman package from this checkout, so it shows up in the app launcher.
+set -euo pipefail
+cd "$(dirname "$0")/../pkgbuild"
+makepkg -fsi -p PKGBUILD.local

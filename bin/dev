@@ -1,0 +1,17 @@
+#!/bin/bash
+# Run Retake from this checkout in a virtual environment (no install needed).
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ ! -x "$root/.venv/bin/python" ]]; then
+  uv venv -q --python /usr/bin/python3 "$root/.venv"
+  if command -v nvidia-smi >/dev/null; then whisper=whisper-cuda12 torch=cu126; else whisper=whisper torch=cpu; fi
+  VIRTUAL_ENV="$root/.venv" uv pip install -q -e "$root[dev,nvidia,obs,pedal,portal,$whisper]"
+  # PyTorch's CUDA 12 build shares the cuBLAS and cuDNN that faster-whisper loads; PyPI's default
+  # build brings another CUDA whose cuDNN clashes with them in the engine process.
+  VIRTUAL_ENV="$root/.venv" uv pip install -q torch --index-url "https://download.pytorch.org/whl/$torch" \
+    --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+fi
+for ts in "$root"/src/retake/i18n/*.ts; do
+  [[ -e "$ts" ]] && "$root/.venv/bin/pyside6-lrelease" "$ts" -qm "${ts%.ts}.qm" >/dev/null
+done
+exec "$root/.venv/bin/retake" "$@"

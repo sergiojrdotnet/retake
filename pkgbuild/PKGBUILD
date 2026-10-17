@@ -1,0 +1,53 @@
+# Maintainer: Sergio Alves Junior <sergiojr@live.com>
+pkgname=retake
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Solo talking recordings with the retakes handled for you: voice-following teleprompter, pronunciation coach, recorder and editor"
+arch=('any')
+url="https://github.com/sergiojrdotnet/retake"
+license=('MIT')
+depends=(
+  'python' 'pyside6' 'qt6-declarative' 'qt6-multimedia' 'qt6-svg'
+  'python-numpy' 'python-soundfile' 'python-sounddevice' 'python-soxr'
+  'python-vosk' 'python-rapidfuzz' 'python-psutil' 'python-tomli-w'
+  'python-platformdirs' 'python-jeepney' 'espeak-ng' 'ffmpeg' 'libpulse'
+)
+optdepends=(
+  'python-pytorch: Silero speech detection and pronunciation scoring on the CPU'
+  'python-pytorch-cuda: Silero and pronunciation scoring on NVIDIA GPUs'
+  'python-pytorch-rocm: Silero and pronunciation scoring on AMD GPUs'
+  'python-faster-whisper: more accurate voice following with Whisper (AUR)'
+  'piper-tts-bin: natural reference voice (AUR)'
+  'scrcpy: Android phone as camera'
+  'gpu-screen-recorder: screen + camera recording'
+  'python-nvidia-ml-py: NVIDIA GPU monitoring'
+  'python-websockets: OBS control'
+  'python-evdev: exclusive foot pedal input'
+  'hyprland: camera window placement'
+)
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'pyside6-tools')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  for ts in src/retake/i18n/*.ts; do
+    pyside6-lrelease "$ts" -qm "${ts%.ts}.qm"
+  done
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  python -c "import sys; sys.path.insert(0, 'src'); import retake.script.parser"
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 pkgbuild/retake.desktop "$pkgdir/usr/share/applications/retake.desktop"
+  install -Dm644 pkgbuild/retake.xml "$pkgdir/usr/share/mime/packages/retake.xml"
+  install -Dm644 src/retake/assets/retake.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/retake.svg"
+  install -Dm644 src/retake/assets/retake-symbolic.svg "$pkgdir/usr/share/icons/hicolor/symbolic/apps/retake-symbolic.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

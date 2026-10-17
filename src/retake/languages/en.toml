@@ -1,0 +1,113 @@
+code = "en"
+name = "English"
+espeak_voice = "en-us"
+whisper_language = "en"
+piper_voice = "en_US-ljspeech-high"
+lexicon = "cmudict"
+numbers = "en"
+segmenter = "space"
+abbreviations = [
+  "e.g.", "i.e.", "etc.", "vs.", "mr.", "mrs.", "ms.", "dr.", "prof.", "inc.",
+  "ltd.", "jr.", "sr.", "st.", "no.", "approx.", "fig.", "cf.", "u.s.", "u.k.", "a.m.", "p.m.", "ph.d.", "et al.",
+]
+fillers = ["um", "uh", "uhm", "erm", "er", "ah", "hmm", "mm", "like", "you know", "i mean", "basically", "actually"]
+function_words = [
+  "a", "an", "the", "to", "of", "and", "or", "but", "in", "on", "at", "for", "from",
+  "by", "with", "as", "is", "are", "was", "were", "be", "been", "am", "it", "its",
+  "i", "you", "your", "we", "our", "he", "she", "his", "her", "me", "my", "us",
+  "do", "does", "did", "can", "will", "would", "should", "could", "have", "has",
+  "had", "not", "so", "if", "here", "what", "who", "how", "when", "where", "which", "just",
+]
+heteronyms = [
+  "address", "aggregate", "alternate", "attribute", "bass", "bow", "close", "compound",
+  "conduct", "conflict", "console", "content", "contract", "contrast", "convert",
+  "decrease", "desert", "digest", "discount", "does", "entrance", "estimate",
+  "export", "extract", "import", "increase", "insert", "invalid", "lead", "live",
+  "minute", "moderate", "object", "perfect", "permit", "present", "produce",
+  "progress", "project", "read", "record", "refuse", "separate", "subject",
+  "tear", "update", "upset", "use", "wind", "wound",
+]
+
+[models]
+tracking = "vosk-en-us-0.22-lgraph"
+commands = "vosk-en-us-small-0.15"
+whisper = "small.en"
+
+[commands]
+wake_word = "retake"
+again = ["again", "one more time", "take it again"]
+next = ["next"]
+back = ["back", "go back"]
+pause = ["pause"]
+resume = ["resume", "continue"]
+mark = ["mark"]
+stop = ["stop recording"]
+listen = ["say it", "how do i say it", "how do i say this"]
+say = ["how do i say"]
+camera_full = ["camera full"]
+camera_corner = ["camera corner"]
+camera_off = ["camera off"]
+skip = ["skip it", "skip word"]
+uncoach = ["don't coach it", "no coaching"]
+drill = ["drill it", "drill words"]
+
+# Other ways the wake word gets heard, as in-vocabulary words; native packs add accent-specific ones.
+[wake_aliases]
+retake = ["re take"]
+
+[respelling]
+separator = "-"
+uppercase_stress = true
+
+[respelling.map]
+AA = "ah"
+AE = "a"
+AH = "uh"
+AO = "aw"
+AW = "ow"
+AY = "y"
+EH = "e"
+ER = "ur"
+EY = "ay"
+IH = "i"
+IY = "ee"
+OW = "oh"
+OY = "oy"
+UH = "uu"
+UW = "oo"
+CH = "ch"
+DH = "dh"
+G = "g"
+HH = "h"
+JH = "j"
+NG = "ng"
+SH = "sh"
+TH = "th"
+Y = "y"
+ZH = "zh"
+
+[[respelling.rules]]
+phone = "AA"
+value = "o"
+open_syllable = false
+
+[[respelling.rules]]
+phone = "AY"
+value = "eye"
+has_onset = false
+
+[[respelling.rules]]
+phone = "IH"
+value = "ih"
+open_syllable = true
+
+[[respelling.rules]]
+phone = "EH"
+value = "eh"
+open_syllable = true
+
+[[respelling.rules]]
+phone = "AH"
+value = "u"
+stressed = true
+open_syllable = false

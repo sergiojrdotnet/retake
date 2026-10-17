@@ -1,0 +1,155 @@
+code = "pt-BR"
+name = "Português (Brasil)"
+espeak_voice = "pt-br"
+whisper_language = "pt"
+segmenter = "space"
+abbreviations = ["sr.", "sra.", "dr.", "dra.", "prof.", "ex.", "etc.", "obs.", "pág.", "nº."]
+fillers = ["né", "tipo", "então", "ãh", "ah", "hum", "éé", "assim", "sabe", "tá"]
+
+[models]
+tracking = "vosk-pt-small-0.3"
+commands = "vosk-pt-small-0.3"
+whisper = "small"
+
+[commands]
+wake_word = "diretor"
+again = ["de novo", "outra vez"]
+next = ["próximo", "próxima"]
+back = ["volta", "voltar"]
+pause = ["pausa"]
+resume = ["continua", "continuar"]
+mark = ["marca"]
+stop = ["parar gravação"]
+listen = ["como se fala isso", "fala isso"]
+say = ["como se fala"]
+camera_full = ["câmera cheia"]
+camera_corner = ["câmera canto"]
+camera_off = ["câmera desligada"]
+skip = ["pula essa", "pular palavra"]
+uncoach = ["sem treino", "não treina essa"]
+drill = ["treina isso", "treinar palavras"]
+
+# How Brazilian speakers' "retake" tends to be heard: the initial r is often an h sound.
+[wake_aliases]
+retake = ["he take", "he'd take", "hi take", "he takes"]
+
+[respelling]
+separator = "-"
+uppercase_stress = true
+
+[respelling.map]
+AA = "á"
+AE = "é"
+AH = "â"
+AO = "ó"
+AW = "áu"
+AY = "ái"
+EH = "é"
+ER = "âr"
+EY = "êi"
+IH = "i"
+IY = "ii"
+OW = "ôu"
+OY = "ói"
+UH = "u"
+UW = "uu"
+B = "b"
+CH = "tch"
+D = "d"
+DH = "dh"
+F = "f"
+G = "g"
+HH = "rr"
+JH = "dj"
+K = "k"
+L = "l"
+M = "m"
+N = "n"
+NG = "ng"
+P = "p"
+R = "r"
+S = "s"
+SH = "ch"
+T = "t"
+TH = "th"
+V = "v"
+W = "u"
+Y = "i"
+Z = "z"
+ZH = "j"
+
+[[respelling.rules]]
+phone = "G"
+value = "gu"
+next_output_prefix = ["e", "i", "é", "ê", "í"]
+
+[[respelling.rules]]
+phone = "S"
+value = "ss"
+between_vowels = true
+
+[[l1_errors]]
+id = "vowel-length"
+title = "Long vs short i"
+description = "English separates long /iː/ (beach, sheet, leave) from short /ɪ/ (bitch, shit, live). Portuguese has a single i, so the two merge."
+expected = ["IY", "IH"]
+heard = ["IH", "IY"]
+
+[[l1_errors]]
+id = "ae-eh"
+title = "Open a vs e"
+description = "/æ/ (bad, man) is more open than /ɛ/ (bed, men); Portuguese speakers often say both as é."
+expected = ["AE"]
+heard = ["EH"]
+
+[[l1_errors]]
+id = "th-stopping"
+title = "TH sounds"
+description = "Put the tongue between the teeth: think is not tink/fink, this is not dis/zis."
+expected = ["TH", "DH"]
+heard = ["T", "F", "S", "D", "Z", "V"]
+
+[[l1_errors]]
+id = "initial-r"
+title = "English R"
+description = "English R is not the Portuguese rr: curl the tongue back without touching (red, right)."
+expected = ["R"]
+heard = ["HH"]
+position = "initial"
+
+[[l1_errors]]
+id = "epenthesis"
+title = "Extra vowel"
+description = "No vowel after a final consonant (big, not big-ee) or before s+consonant (study, not estudy)."
+extra = ["IH", "IY", "EH"]
+
+[[l1_errors]]
+id = "ed-ending"
+title = "-ed ending"
+description = "After most sounds -ed is just /t/ or /d/ (worked = workt, played = playd), not an extra syllable."
+extra = ["IH", "EH"]
+before_final = ["T", "D"]
+
+[[l1_errors]]
+id = "final-l"
+title = "Final L"
+description = "Keep the tongue on the ridge for final L (full, people); don't turn it into u."
+expected = ["L"]
+heard = ["W", "UW", "UH"]
+position = "final"
+
+[[l1_errors]]
+id = "palatalization"
+title = "T and D before i"
+description = "T and D stay clean before i (team, did): not tchim or djid."
+expected = ["T", "D"]
+heard = ["CH", "JH"]
+
+[[l1_errors]]
+id = "final-nasal"
+title = "Final M and N"
+description = "Close the lips for final M and touch the ridge for final N (him, ten); don't just nasalize the vowel."
+expected = ["M", "N"]
+heard = []
+position = "final"
+missing = true

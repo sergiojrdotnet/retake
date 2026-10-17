@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Retake</title>
+  <desc>An open clapperboard: black and white striped clapper over a dark slate that carries a warm circular retake arrow.</desc>
+  <defs>
+    <linearGradient id="arrow" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ffc861"/>
+      <stop offset="1" stop-color="#ff5f6d"/>
+    </linearGradient>
+    <linearGradient id="slate" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#2a2b38"/>
+      <stop offset="1" stop-color="#15151d"/>
+    </linearGradient>
+    <clipPath id="clapper">
+      <rect x="0" y="0" width="392" height="72" rx="14"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(58 202) rotate(-12) translate(0 -72)">
+    <rect x="6" y="10" width="392" height="72" rx="14" fill="#0b0b10"/>
+    <g clip-path="url(#clapper)">
+      <rect width="392" height="72" fill="#f4f1ea"/>
+      <g fill="#15151d">
+        <path d="M30 0h46L46 72H0z"/>
+        <path d="M122 0h46l-30 72H92z"/>
+        <path d="M214 0h46l-30 72h-46z"/>
+        <path d="M306 0h46l-30 72h-46z"/>
+      </g>
+    </g>
+  </g>
+  <rect x="62" y="218" width="400" height="244" rx="40" fill="#0b0b10"/>
+  <rect x="56" y="210" width="400" height="244" rx="40" fill="url(#slate)"/>
+  <rect x="56" y="210" width="400" height="44" rx="22" fill="#f4f1ea" opacity=".08"/>
+  <g transform="translate(256 338)">
+    <path d="M34 -58.9A68 68 0 1 1 -17.6 -65.7" fill="none" stroke="#0b0b10" stroke-width="30" stroke-linecap="round" transform="translate(5 6)"/>
+    <path d="M19 -83.4 -30.6 -103.6 -22.6 -40.2z" fill="#0b0b10" stroke="#0b0b10" stroke-width="10" stroke-linejoin="round" transform="translate(5 6)"/>
+    <path d="M34 -58.9A68 68 0 1 1 -17.6 -65.7" fill="none" stroke="url(#arrow)" stroke-width="30" stroke-linecap="round"/>
+    <path d="M19 -83.4 -30.6 -103.6 -22.6 -40.2z" fill="#ffc861" stroke="#ffc861" stroke-width="10" stroke-linejoin="round"/>
+  </g>
+</svg>

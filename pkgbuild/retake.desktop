@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Retake
+GenericName=Teleprompter and recorder
+Comment=Record yourself talking; the retakes are handled for you
+Exec=retake %f
+Icon=retake
+Terminal=false
+Categories=AudioVideo;Recorder;Video;
+MimeType=application/x-retake-project;text/markdown;
+Keywords=teleprompter;prompter;recorder;voice;pronunciation;retake;
+StartupWMClass=retake

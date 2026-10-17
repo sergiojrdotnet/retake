@@ -1,0 +1,5 @@
+#!/bin/bash
+# Run the unit tests (no audio devices or GPU needed).
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$root/.venv/bin/python" -m pytest -q "$root/tests" "$@"
