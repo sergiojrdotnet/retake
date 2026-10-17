@@ -21,13 +21,13 @@ optdepends=(
   'python-websockets: OBS control'
   'python-evdev: exclusive foot pedal input'
 )
-makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'pyside6-tools')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'qt6-tools')
 
 build() {
   cd "$startdir/.."
   rm -rf dist build
   for ts in src/retake/i18n/*.ts; do
-    pyside6-lrelease "$ts" -qm "${ts%.ts}.qm"
+    /usr/lib/qt6/bin/lrelease "$ts" -qm "${ts%.ts}.qm"
   done
   python -m build --wheel --no-isolation
 }

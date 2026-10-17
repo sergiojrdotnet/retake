@@ -145,11 +145,16 @@ def gpu_present() -> bool:
 
 
 def whisper_cuda_ready() -> bool:
-    if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
+    """Whether CTranslate2 can find cuBLAS and cuDNN: the pip nvidia-* packages beside a wheel, or the
+    system's CUDA libraries for a CTranslate2 built against them (Arch's ctranslate2-cuda)."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES") == "" or not Path("/dev/nvidia0").exists():
         return False
-    return Path("/dev/nvidia0").exists() and all(
+    from ctypes.util import find_library
+
+    pip = importlib.util.find_spec("nvidia") is not None and all(
         importlib.util.find_spec(f"nvidia.{library}") is not None for library in ("cublas", "cudnn")
     )
+    return pip or all(find_library(library) for library in ("cublas", "cudnn"))
 
 
 def torch_device() -> str:

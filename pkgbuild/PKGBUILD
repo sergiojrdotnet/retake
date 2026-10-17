@@ -25,14 +25,14 @@ optdepends=(
   'python-evdev: exclusive foot pedal input'
   'hyprland: camera window placement'
 )
-makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'pyside6-tools')
+makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
   cd "$pkgname-$pkgver"
   for ts in src/retake/i18n/*.ts; do
-    pyside6-lrelease "$ts" -qm "${ts%.ts}.qm"
+    /usr/lib/qt6/bin/lrelease "$ts" -qm "${ts%.ts}.qm"
   done
   python -m build --wheel --no-isolation
 }
