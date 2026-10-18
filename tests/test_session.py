@@ -4,8 +4,7 @@ from retake.languages import packs
 from retake.script.parser import parse
 from retake.session import takes as kinds
 from retake.session.coach import detect_patterns
-from retake.session.free import FreeTracker, is_retry
-from retake.session.session import FREE, Session, SessionSettings
+from retake.session.session import Session, SessionSettings
 from retake.session.takes import COMPLETE, REJECTED, TakeLog
 
 
@@ -49,7 +48,7 @@ def scripted():
 
 def test_scripted_session_scores_and_chapters():
     session, listener = scripted()
-    t = say(session, "we flush the cache to disk", 0.0)
+    say(session, "we flush the cache to disk", 0.0)
     assert session.log.takes[0].status == COMPLETE
     assert listener.requests("score") and listener.requests("score")[0]["words"][0]["text"] == "We"
     assert [m.label for m in session.log.markers_of(kinds.CHAPTER)] == ["Intro"]
@@ -98,7 +97,7 @@ def score_take(session, listener, low_word=3, low=20.0, others=90.0):
 def test_require_level_sends_back_without_the_drill():
     session, listener = scripted()
     session.settings.coach.require = 40
-    session.settings.coach.drill = False
+    session.settings.coach.drill_times = 0
     say(session, "we flush the cache to disk", 0.0)
     score_take(session, listener)
     assert session.log.takes[0].status == REJECTED
@@ -179,11 +178,11 @@ def test_skip_and_uncoach_move_on_and_uncoached_words_are_never_scored():
     session.handle("skip")
     assert session.drill is None and session.log.takes[0].flagged[0]["drill"] == "skipped"
     t = say(session, "we flush the cache to disk", 5.0)
-    score_take(session, listener)
+    score_take(session, listener, low_word=1)
     session.handle("uncoach")
-    assert "cache" in session.history.uncoached() and session.drill is None
+    assert "flush" in session.history.uncoached() and session.drill is None
     say(session, "we flush the cache to disk", t + 2)
-    score_take(session, listener)
+    score_take(session, listener, low_word=1)
     assert session.log.takes[-1].status == COMPLETE and session.log.takes[-1].flagged == []
 
 
@@ -206,23 +205,6 @@ def test_pause_marks_and_resumes():
     pause = session.log.markers_of(kinds.PAUSE)[0]
     assert (pause.start, pause.end) == (1.0, 3.0)
     assert session.state == "listening"
-
-
-def test_free_session_detects_restarts_and_fillers():
-    listener = Listener()
-    log = TakeLog()
-    session = Session(log, SessionSettings(mode=FREE), listener, None, packs.get("en"))
-    session.start()
-    t = say(session, "the event store keeps every change", 0.0)
-    t = say(session, "the event store keeps every single change", t)
-    t = say(session, "um uh", t)
-    assert [take.status for take in log.takes] == [REJECTED, COMPLETE]
-    assert log.markers_of(kinds.FILLER)
-
-
-def test_retry_similarity():
-    assert is_retry("we flush the cache to disk", "we flush the cache to the disk")
-    assert not is_retry("we flush the cache to disk", "latency matters a lot here")
 
 
 def test_l1_patterns():
@@ -353,7 +335,7 @@ def test_piper_says_the_given_ipa_in_its_own_symbols(tmp_path):
 def test_drill_on_demand_takes_the_warned_words_of_this_or_the_previous_sentence():
     session, listener = scripted()
     session.settings.coach.require = 30
-    t = say(session, "we flush the cache to disk", 0.0)
+    say(session, "we flush the cache to disk", 0.0)
     request = listener.requests("score")[-1]
     scores = [{"score": 90, "expected": "", "heard": ""} for _ in request["words"]]
     scores[1] = {"score": 45, "expected": "flʌʃ", "heard": ""}
@@ -390,3 +372,51 @@ def test_a_voice_command_during_a_drill_is_not_a_try():
     session.on_engine({"type": "progress", "time": t + 3})
     session.tick(t + 2.5)
     assert session.drill.attempts == 0 and session.drill.passes == 0
+
+
+def test_a_word_skipped_in_a_drill_is_left_alone_for_the_rest_of_the_recording():
+    session, listener = scripted()
+    session.settings.coach.require = 40
+    t = say(session, "we flush the cache to disk", 0.0)
+    score_take(session, listener)
+    session.handle("skip")
+    t = say(session, "we flush the cache to disk", t + 3)
+    score_take(session, listener)
+    assert session.drill is None and session.log.takes[-1].status == COMPLETE
+    session.handle("drill")
+    assert session.drill is None, "nor on demand"
+
+
+def test_voice_stop_asks_for_the_whole_recording_to_stop():
+    session, listener = scripted()
+    session.on_engine({"type": "command", "action": "stop", "start": 1.0, "end": 1.6})
+    session.on_engine({"type": "progress", "time": 3.0})
+    assert ("stop_requested", ()) in listener.calls
+
+
+def test_clearing_the_practice_history_keeps_the_words_not_coached(tmp_path):
+    from retake.session.coach import PracticeHistory
+
+    history = PracticeHistory(tmp_path / "practice.json")
+    history.record("cache", True)
+    history.record("cache", True)
+    history.flag("cache")
+    history.set_coached("sergio", False)
+    history.clear()
+    history.save()
+    reloaded = PracticeHistory.load(tmp_path / "practice.json")
+    assert reloaded.drill_list() == [] and reloaded.flagged() == set() and reloaded.uncoached() == {"sergio"}
+
+
+def test_stopping_ends_the_session_with_or_without_a_take_in_progress():
+    session, listener = scripted()
+    say(session, "we flush the cache to disk", 0.0)
+    session.stop()
+    assert session.state == "stopped" and session.log.takes[0].status == COMPLETE
+    session, listener = scripted()
+    tokens, _ = words("we flush the", 0.0)
+    session.on_engine({"type": "vad", "speech": True, "time": 0.0})
+    session.on_engine({"type": "words", "final": True, "words": tokens})
+    assert session.tracker.take is not None
+    session.stop()
+    assert session.state == "stopped" and session.log.takes[-1].status == REJECTED

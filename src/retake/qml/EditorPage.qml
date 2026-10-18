@@ -6,16 +6,42 @@ import Retake 1.0
 
 Item {
     id: page
+    signal exportRequested(string kind)
     property real playhead: 0
     property real userPps: 0
     property real pps: userPps > 0 ? userPps : fitPps
     property real fitPps: Math.max(2, (timelineFlick.width - 20) / Math.max(1, timelineDuration))
-    // The timeline shows the edit as it plays (kept clips back to back) unless the full recording is
-    // asked for, where removed stretches stay visible, greyed, to be restored.
+    // The timeline is the script: the edit as it plays, kept clips back to back. V shows what was cut:
+    // each take in use whole, still in script order, its cuts greyed. With nothing kept, the raw
+    // recording shows on its own clock.
     property bool fullView: false
-    property bool showFull: fullView || emptyEdit
+    property bool rawView: emptyEdit
+    property bool blockView: fullView && !emptyEdit
     property var segments: editor.segments
-    property real timelineDuration: showFull ? editor.sourceDuration : editor.editDuration
+    property var rows: rawView ? [] : (blockView ? editor.blocks : segments)
+    property real rowsDuration: rows.length ? rows[rows.length - 1].editStart + rows[rows.length - 1].end - rows[rows.length - 1].start : 0
+    property real timelineDuration: rawView ? editor.sourceDuration : rowsDuration
+    property int focusSentence: selected.length === 1 ? selected[0] : editor.sentenceAt(playhead)
+    // The script's sections as bands over the rows: each from its first sentence on the timeline to
+    // its last (in script order a section's sentences sit together).
+    property var chapters: {
+        const bySentence = editor.scriptSections.bySentence || []
+        const titles = editor.scriptSections.titles || []
+        const bands = []
+        for (const row of rows) {
+            const section = row.sentence >= 0 && row.sentence < bySentence.length ? bySentence[row.sentence] : -1
+            const end = row.editStart + row.end - row.start
+            const last = bands.length ? bands[bands.length - 1] : null
+            if (section >= 0 && (!last || last.section !== section)) {
+                bands.push({ section: section, title: titles[section], start: row.editStart, end: end, sentences: [row.sentence] })
+            } else if (last) {
+                last.end = end
+                if (row.sentence >= 0 && last.sentences.indexOf(row.sentence) < 0)
+                    last.sentences.push(row.sentence)
+            }
+        }
+        return bands
+    }
     property real playheadPos: timelineX(playhead, true)
     property bool zoomed: false
     property bool playing: player.playbackState === MediaPlayer.PlayingState || resumeAfterLoad
@@ -28,7 +54,7 @@ Item {
     property bool syncingPicture: false
     property string pendingSource: ""
     property bool resumeAfterLoad: false
-    property var currentClip: null
+    property int currentRow: -1
     property real startAt: 0
     property var selected: []
     property int anchorSentence: -1
@@ -91,42 +117,75 @@ Item {
         }
     }
 
-    // Each recording part is its own media file; crossing into another part swaps the source.
-    // Recording time to edit time; -1 when that moment was cut.
-    function editTime(t) {
-        for (const segment of segments) {
-            if (t >= segment.start && t < segment.end)
-                return segment.editStart + (t - segment.start)
+    // Recording time to timeline time, the rows laid back to back; -1 when that moment isn't shown.
+    function viewTime(t) {
+        for (const row of rows) {
+            if (t >= row.start && t < row.end)
+                return row.editStart + (t - row.start)
         }
         return -1
     }
 
     function sourceTime(e) {
-        for (const segment of segments) {
-            if (e < segment.editStart + (segment.end - segment.start))
-                return segment.start + Math.max(0, e - segment.editStart)
+        for (const row of rows) {
+            if (e < row.editStart + (row.end - row.start))
+                return row.start + Math.max(0, e - row.editStart)
         }
-        return segments.length ? segments[segments.length - 1].end : 0
+        return rows.length ? rows[rows.length - 1].end : 0
     }
 
-    // Where a recording moment sits on the timeline; in the edit view a cut moment is -1, or, with
-    // `nearest`, the start of the next kept clip.
+    // Where a recording moment sits on the timeline; a moment not shown is -1, or, with `nearest`,
+    // the start of the next row.
     function timelineX(t, nearest) {
-        if (showFull)
+        if (rawView)
             return t * pps
-        const e = editTime(t)
+        const e = viewTime(t)
         if (e >= 0 || !nearest)
             return e < 0 ? -1 : e * pps
-        const next = segments.filter(s => s.start >= t).sort((a, b) => a.start - b.start)[0]
-        return (next ? next.editStart : editor.editDuration) * pps
+        const next = rows.filter(s => s.start >= t).sort((a, b) => a.start - b.start)[0]
+        return (next ? next.editStart : rowsDuration) * pps
     }
 
     function timeAtX(x) {
-        return showFull ? x / pps : sourceTime(Math.max(0, x / pps))
+        return rawView ? x / pps : sourceTime(Math.max(0, x / pps))
+    }
+
+    // Previous / next clip edge, take or marker, in the order the timeline shows them.
+    function jumpEdge(direction) {
+        if (rawView) {
+            seek(editor.nextEdge(playhead, direction))
+            return
+        }
+        const points = []
+        for (const row of rows)
+            points.push(row.editStart, row.editStart + row.end - row.start)
+        const marks = editor.markPoints()
+        if (blockView) {
+            for (const clip of editor.clips)
+                marks.push(clip.start, clip.end)
+        }
+        for (const t of marks) {
+            const e = viewTime(t)
+            if (e >= 0)
+                points.push(e)
+        }
+        points.sort((a, b) => a - b)
+        const now = playheadPos / pps
+        const target = direction > 0 ? points.find(p => p > now + 0.02) : points.slice().reverse().find(p => p < now - 0.02)
+        seek(sourceTime(target === undefined ? (direction > 0 ? rowsDuration : 0) : target))
+    }
+
+    // 0-9: that tenth of the timeline.
+    function jumpToTenth(tenth) {
+        if (rawView)
+            seek(editor.sourceDuration * tenth / 10)
+        else
+            seek(sourceTime(rowsDuration * tenth / 10))
     }
 
     function toggleView() {
         fullView = !fullView
+        currentRow = -1
         Qt.callLater(() => { timelineFlick.contentX = Math.max(0, Math.min(timelineFlick.contentWidth - timelineFlick.width, playheadPos - timelineFlick.width * 0.3)) })
     }
 
@@ -160,7 +219,7 @@ Item {
     }
 
     function nudge(delta) {
-        if (showFull) {
+        if (rawView) {
             seek(playhead + delta)
             return
         }
@@ -223,25 +282,36 @@ Item {
             pause()
             return
         }
-        if (emptyEdit) {
+        if (rawView) {
             if (playhead >= editor.sourceDuration - 0.05)
                 seek(0)
             play()
             return
         }
-        let clip = editor.clipAt(playhead)
-        if (!clip) {
-            const start = playhead <= 0.05 ? -1 : editor.playableFrom(playhead)
-            clip = start < 0 ? editor.firstClip() : editor.clipAt(start)
-            if (clip)
-                seek(clip.start)
-        }
-        currentClip = clip
+        let index = rows.findIndex(r => playhead >= r.start && playhead < r.end - 0.01)
+        if (index < 0 || playheadPos >= (rowsDuration - 0.05) * pps)
+            index = playheadPos >= (rowsDuration - 0.05) * pps || playhead <= 0.05 ? 0 : nextRowAfter(playhead)
+        if (index < 0 || !rows.length)
+            return
+        if (!(playhead >= rows[index].start && playhead < rows[index].end - 0.01))
+            seek(rows[index].start)
+        currentRow = index
         play()
     }
 
+    function nextRowAfter(t) {
+        let best = -1
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i].start >= t && (best < 0 || rows[i].start < rows[best].start))
+                best = i
+        }
+        return best
+    }
+
+    // Playback walks the rows in timeline order: in the edit view the kept clips, in V each whole
+    // take, cuts included.
     function advance(t) {
-        if (emptyEdit) {
+        if (rawView) {
             const part = parts[partIndex]
             if (t >= part.end - 0.02) {
                 if (partIndex + 1 < parts.length)
@@ -251,24 +321,32 @@ Item {
             }
             return
         }
-        if (!currentClip || t < currentClip.start - 0.25 || t > currentClip.end + 0.5)
-            currentClip = editor.clipAt(t)
-        if (currentClip && t >= currentClip.end - 0.01) {
-            const next = editor.nextClip(currentClip.id)
-            currentClip = next
-            if (next)
-                seek(next.start)
+        if (currentRow < 0 || currentRow >= rows.length || t < rows[currentRow].start - 0.25 || t > rows[currentRow].end + 0.5)
+            currentRow = rows.findIndex(r => t >= r.start && t < r.end)
+        if (currentRow >= 0 && t >= rows[currentRow].end - 0.01) {
+            currentRow = currentRow + 1 < rows.length ? currentRow + 1 : -1
+            if (currentRow >= 0)
+                seek(rows[currentRow].start)
             else
                 pause()
-        } else if (!currentClip) {
-            const start = editor.playableFrom(t)
-            if (start < 0) {
+        } else if (currentRow < 0) {
+            const next = nextRowAfter(t)
+            if (next < 0) {
                 pause()
             } else {
-                currentClip = editor.clipAt(start)
-                seek(start)
+                currentRow = next
+                seek(rows[next].start)
             }
         }
+    }
+
+    function useTake(take) {
+        const start = editor.useTake(take)
+        if (start < 0)
+            return
+        currentRow = -1
+        seek(start + 0.001)
+        play()
     }
 
     function selectSentence(sentence, mouse) {
@@ -320,7 +398,7 @@ Item {
             page.partIndex = -1
             page.pendingTime = -1
             page.resumeAfterLoad = false
-            page.currentClip = null
+            page.currentRow = -1
             page.startAt = 0
             Qt.callLater(() => page.seek(page.startAt))
         }
@@ -392,7 +470,12 @@ Item {
                 font.pixelSize: 16
                 font.bold: true
             }
-            Label { visible: editor.isDirty; text: qsTr("unsaved"); color: theme.yellow; font.pixelSize: 12 }
+            Label {
+                visible: page.fullView && !page.emptyEdit
+                text: page.blockView ? qsTr("Whole takes, cuts greyed · V goes back") : qsTr("Raw recording · V goes back")
+                color: theme.accent
+                font.pixelSize: 12
+            }
             Label {
                 visible: page.emptyEdit && !page.nothingRecorded
                 text: qsTr("Nothing is kept: every take was rejected. Space plays the raw recording; X on a take keeps it.")
@@ -418,77 +501,88 @@ Item {
                 ToolTip.text: qsTr("R · records the selected sentences again (click a clip to select, Shift+click for a range)")
             }
             Button {
-                text: page.showFull ? qsTr("Edit view") : qsTr("Show removed")
-                enabled: !page.emptyEdit
-                onClicked: page.toggleView()
+                text: qsTr("Reset edit")
+                enabled: !page.nothingRecorded && editor.canReset
+                onClicked: editor.resetEdit()
                 ToolTip.visible: hovered
-                ToolTip.text: page.showFull ? qsTr("V · show only what's kept, clips back to back") : qsTr("V · show the whole recording, with the removed parts greyed")
+                ToolTip.text: qsTr("A · back to the automatic cut with the current edit settings; Ctrl+Z brings your changes back")
             }
-            Button { text: qsTr("Auto edit"); highlighted: true; enabled: !page.nothingRecorded; onClicked: editor.autoEdit(); ToolTip.visible: hovered; ToolTip.text: qsTr("A · rebuild the edit from the takes (undoes hand edits)") }
             Button { text: qsTr("Undo"); enabled: editor.canUndo; onClicked: editor.undo() }
             Button { text: qsTr("Redo"); enabled: editor.canRedo; onClicked: editor.redo() }
-            Button { text: qsTr("Save"); enabled: editor.isDirty; onClicked: editor.save() }
             Button {
                 id: exportButton
                 text: editor.rendering ? qsTr("Rendering %1%").arg(Math.round(editor.renderProgress * 100)) : qsTr("Export…")
                 enabled: !editor.rendering && !page.nothingRecorded
                 onClicked: exportMenu.open()
+                ToolTip.visible: hovered && !exportMenu.visible
+                ToolTip.text: qsTr("Ctrl+E exports the video (or the audio) again with your last choices")
                 Menu {
                     id: exportMenu
                     y: exportButton.height
-                    width: 340
+                    width: 280
                     x: exportButton.width - width
-                    MenuItem { text: qsTr("Video (MP4)"); enabled: editor.hasVideo; onTriggered: editor.render("video") }
-                    MenuItem { text: qsTr("Video, HEVC (MP4, smaller)"); enabled: editor.hasVideo; onTriggered: editor.render("video-hevc") }
-                    MenuItem { text: qsTr("Narration (FLAC)"); onTriggered: editor.render("narration-flac") }
-                    MenuItem { text: qsTr("Narration (MP3)"); onTriggered: editor.render("narration-mp3") }
-                    MenuItem { text: qsTr("Narration (Opus)"); onTriggered: editor.render("narration-opus") }
-                    MenuItem { text: qsTr("Narration (WAV)"); onTriggered: editor.render("narration-wav") }
+                    MenuItem { text: qsTr("Video…"); enabled: editor.hasVideo; onTriggered: page.exportRequested("video") }
+                    MenuItem { text: qsTr("Audio…"); onTriggered: page.exportRequested("audio") }
+                    MenuItem { text: qsTr("Captions…"); onTriggered: page.exportRequested("captions") }
+                    MenuItem { text: qsTr("Timeline…"); onTriggered: page.exportRequested("timeline") }
                     MenuSeparator {}
-                    MenuItem { text: qsTr("Timeline for Resolve / Kdenlive (OTIO)"); onTriggered: editor.render("timeline") }
-                    MenuItem { text: qsTr("Captions (VTT + SRT)"); onTriggered: editor.render("captions") }
                     MenuItem { text: qsTr("Script timing (JSON)"); enabled: editor.hasScript; onTriggered: editor.render("sentences") }
                     MenuItem { text: qsTr("Audacity labels"); onTriggered: editor.render("labels") }
-                    MenuItem { text: qsTr("Raw recording + markers"); onTriggered: editor.render("raw") }
+                    MenuItem { text: qsTr("Raw recording + markers (OTIO)"); onTriggered: editor.render("raw") }
                     MenuSeparator {}
                     MenuItem { text: qsTr("Open output folder"); onTriggered: editor.openOutput() }
                 }
             }
         }
 
-        Rectangle {
+        RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            color: "black"
-            radius: 6
-            VideoOutput {
-                id: video
-                anchors.fill: parent
-                visible: page.partHasVideo
+            spacing: 8
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                color: "black"
+                radius: 6
+                VideoOutput {
+                    id: video
+                    anchors.fill: parent
+                    visible: page.partHasVideo
+                }
+                Label {
+                    anchors.centerIn: parent
+                    visible: !page.partHasVideo && !page.nothingRecorded
+                    text: (editor.hasVideo ? qsTr("No video in this part  ·  %1") : qsTr("Audio only  ·  %1")).arg(page.clock(page.playhead))
+                    font.pixelSize: 28
+                    opacity: 0.5
+                }
+                ColumnLayout {
+                    anchors.centerIn: parent
+                    visible: page.nothingRecorded
+                    spacing: 10
+                    Label { text: qsTr("Nothing recorded for this script yet"); font.pixelSize: 24; Layout.alignment: Qt.AlignHCenter }
+                    Label { text: qsTr("Switch to Record (Ctrl+Tab) and press Space."); opacity: 0.6; Layout.alignment: Qt.AlignHCenter }
+                    Button { text: qsTr("Go to Record"); highlighted: true; Layout.alignment: Qt.AlignHCenter; onClicked: app.showView("record") }
+                }
+                Label {
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.margins: 10
+                    text: page.clock(page.playhead)
+                    font.family: "monospace"
+                    font.pixelSize: 16
+                    color: "white"
+                }
             }
-            Label {
-                anchors.centerIn: parent
-                visible: !page.partHasVideo && !page.nothingRecorded
-                text: (editor.hasVideo ? qsTr("No video in this part  ·  %1") : qsTr("Audio only  ·  %1")).arg(page.clock(page.playhead))
-                font.pixelSize: 28
-                opacity: 0.5
-            }
-            ColumnLayout {
-                anchors.centerIn: parent
-                visible: page.nothingRecorded
-                spacing: 10
-                Label { text: qsTr("Nothing recorded for this script yet"); font.pixelSize: 24; Layout.alignment: Qt.AlignHCenter }
-                Label { text: qsTr("Switch to Record (Ctrl+Tab) and press Space."); opacity: 0.6; Layout.alignment: Qt.AlignHCenter }
-                Button { text: qsTr("Go to Record"); highlighted: true; Layout.alignment: Qt.AlignHCenter; onClicked: app.showView("record") }
-            }
-            Label {
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                anchors.margins: 10
-                text: page.clock(page.playhead)
-                font.family: "monospace"
-                font.pixelSize: 16
-                color: "white"
+
+            SentencePanel {
+                visible: editor.hasScript && !page.nothingRecorded
+                Layout.preferredWidth: 320
+                Layout.fillHeight: true
+                sentence: page.focusSentence
+                choices: page.focusSentence >= 0 ? (page.segments, editor.sentenceChoices(page.focusSentence)) : ({})
+                onChosen: (take) => page.useTake(take)
             }
         }
 
@@ -514,8 +608,9 @@ Item {
                     width: timelineFlick.contentWidth
                     height: timelineFlick.height - 14
 
+                    property real laneChapters: page.chapters.length ? 24 : 0
                     property real laneFilm: editor.hasVideo ? 44 : 0
-                    property real yWave: laneFilm + 4
+                    property real yWave: laneChapters + laneFilm + 4
                     property real waveHeight: 70
                     property real yClips: yWave + waveHeight + 4
                     property real yTakes: yClips + 26
@@ -527,7 +622,7 @@ Item {
                         delegate: Image {
                             required property var modelData
                             x: page.timelineX(modelData.time, false)
-                            y: 0
+                            y: lanes.laneChapters
                             height: 40
                             width: 71
                             fillMode: Image.PreserveAspectCrop
@@ -537,8 +632,47 @@ Item {
                         }
                     }
 
+                    Repeater {
+                        model: page.chapters
+                        delegate: Rectangle {
+                            id: band
+                            required property var modelData
+                            required property int index
+                            property color tint: theme.accent
+                            x: modelData.start * page.pps
+                            width: Math.max(2, (modelData.end - modelData.start) * page.pps)
+                            height: 20
+                            radius: 3
+                            z: 3
+                            color: Qt.rgba(tint.r, tint.g, tint.b, index % 2 ? 0.16 : 0.28)
+                            Rectangle { width: 2; height: parent.height; color: band.tint }
+                            Label {
+                                // Stays in view at the left edge while a long chapter scrolls past.
+                                x: Math.max(6, Math.min(timelineFlick.contentX - band.x + 6, band.width - width - 6))
+                                width: Math.min(implicitWidth, band.width - 12)
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: band.modelData.title
+                                elide: Text.ElideRight
+                                font.pixelSize: 11
+                                font.bold: true
+                                visible: band.width > 24
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    page.selected = band.modelData.sentences.slice().sort((a, b) => a - b)
+                                    page.anchorSentence = page.selected[0]
+                                    page.seek(page.sourceTime(band.modelData.start) + 0.001)
+                                }
+                            }
+                            ToolTip.visible: chapterHover.hovered
+                            ToolTip.text: band.modelData.title + "\n" + qsTr("Click to select its %n sentence(s); R re-records them", "", band.modelData.sentences.length)
+                            HoverHandler { id: chapterHover }
+                        }
+                    }
+
                     Waveform {
-                        visible: page.showFull
+                        visible: page.rawView
                         x: timelineFlick.contentX
                         y: lanes.yWave
                         width: timelineFlick.width
@@ -552,10 +686,10 @@ Item {
                         kept: editor.clips
                     }
 
-                    // Each kept clip draws its own stretch of the waveform, cut to the visible window so a
-                    // long clip at high zoom never needs a huge texture.
+                    // Each row draws its own stretch of the waveform, cut to the visible window so a long
+                    // row at high zoom never needs a huge texture. In V, what was cut from a take is grey.
                     Repeater {
-                        model: page.showFull ? [] : page.segments
+                        model: page.rows
                         delegate: Waveform {
                             required property var modelData
                             property real fromX: Math.max(modelData.editStart * page.pps, timelineFlick.contentX)
@@ -569,14 +703,14 @@ Item {
                             perSecond: 100
                             viewStart: modelData.start + (fromX / page.pps - modelData.editStart)
                             viewEnd: modelData.start + (toX / page.pps - modelData.editStart)
-                            color: theme.accent
+                            color: page.blockView ? Qt.rgba(1, 1, 1, 0.25) : theme.accent
                             keptColor: theme.accent
-                            kept: []
+                            kept: page.blockView ? editor.clips : []
                         }
                     }
 
                     Repeater {
-                        model: page.showFull ? [] : page.segments.slice(1)
+                        model: page.rows.slice(1)
                         delegate: Rectangle {
                             required property var modelData
                             x: modelData.editStart * page.pps
@@ -588,7 +722,7 @@ Item {
                     }
 
                     Repeater {
-                        model: page.showFull && page.parts.length > 1 ? page.parts : []
+                        model: page.rawView && page.parts.length > 1 ? page.parts : []
                         delegate: Item {
                             required property var modelData
                             x: modelData.start * page.pps
@@ -608,11 +742,12 @@ Item {
                     }
 
                     Repeater {
-                        model: page.showFull ? editor.clips : page.segments
+                        model: page.rawView || page.blockView ? editor.clips : page.segments
                         delegate: Rectangle {
                             required property var modelData
                             property bool isSelected: modelData.sentence >= 0 && page.selected.indexOf(modelData.sentence) >= 0
-                            x: (page.showFull ? modelData.start : modelData.editStart) * page.pps
+                            x: page.blockView ? page.timelineX(modelData.start, false) : (page.rawView ? modelData.start : modelData.editStart) * page.pps
+                            visible: x >= 0
                             width: Math.max(2, (modelData.end - modelData.start) * page.pps)
                             y: lanes.yClips
                             height: 22
@@ -642,10 +777,10 @@ Item {
                     }
 
                     Repeater {
-                        model: page.showFull ? editor.takes : page.segments.filter(s => s.number > 0)
+                        model: page.rawView ? editor.takes : page.rows.filter(s => s.number > 0)
                         delegate: Rectangle {
                             required property var modelData
-                            x: (page.showFull ? modelData.start : modelData.editStart) * page.pps
+                            x: (page.rawView ? modelData.start : modelData.editStart) * page.pps
                             width: Math.max(2, (modelData.end - modelData.start) * page.pps)
                             y: lanes.yTakes
                             height: 24
@@ -693,9 +828,9 @@ Item {
                                 return []
                             const from = (timelineFlick.contentX - 100) / page.pps
                             const to = (timelineFlick.contentX + timelineFlick.width + 100) / page.pps
-                            if (page.showFull)
+                            if (page.rawView)
                                 return editor.words.filter(w => w.end >= from && w.start <= to)
-                            const shown = page.segments.filter(s => s.editStart + s.end - s.start >= from && s.editStart <= to)
+                            const shown = page.rows.filter(s => s.editStart + s.end - s.start >= from && s.editStart <= to)
                             return editor.words.filter(w => shown.some(s => w.start >= s.start && w.start < s.end))
                         }
                         delegate: Label {

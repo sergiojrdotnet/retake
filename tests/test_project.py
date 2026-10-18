@@ -1,6 +1,5 @@
-import json
-
 import numpy as np
+import pytest
 import soundfile as sf
 
 from retake import project as projects
@@ -43,7 +42,8 @@ def test_project_imports_scripts_and_lines_up_parts(tmp_path):
 
 
 def test_merging_a_part_moves_takes_onto_the_item_timeline(tmp_path):
-    item_log = TakeLog(tmp_path / "takes.json")
+    saved = []
+    item_log = TakeLog(saved.append)
     first = item_log.new_take(0, 1.0, "One two three.")
     first.end, first.status = 2.0, COMPLETE
     part = TakeLog()
@@ -54,7 +54,7 @@ def test_merging_a_part_moves_takes_onto_the_item_timeline(tmp_path):
     added = projects.merge_takes(item_log, part, 10.0)
     assert (added[0].id, added[0].number, added[0].start, added[0].words[0].start) == (2, 2, 10.5, 10.6)
     assert item_log.markers[0].start == 11.5
-    assert json.loads((tmp_path / "takes.json").read_text())["takes"][1]["start"] == 10.5
+    assert saved[-1]["takes"][1]["start"] == 10.5
 
 
 def test_edited_scripts_keep_takes_on_the_right_sentence(tmp_path):
@@ -103,13 +103,47 @@ def test_reworded_sentences_keep_their_takes_as_stale(tmp_path):
 
 def test_crashed_parts_are_recovered(tmp_path):
     project = projects.Project.create(tmp_path / "P", "P")
-    item = project.add_free()
+    source = tmp_path / "ep.md"
+    source.write_text("One two.")
+    item = project.add_script(source)
     tone(item.folder / "part-001.flac", 2.0)
-    pending = TakeLog(item.folder / "part-001.takes.json")
-    pending.new_take(None, 0.5, "hello")
+    (item.folder / "part-001.mkv").write_bytes(b"video")
+    item.recording_log(1).new_take(None, 0.5, "hello")
+    project.close()
+    reopened = projects.Project.load(project.path)
+    item = reopened.items[0]
     assert projects.recover_parts(item) == [1]
-    assert item.parts[0].kind == "recovered" and item.load_takes().takes[0].start == 0.5
-    assert not (item.folder / "part-001.takes.json").exists()
+    assert item.parts[0].kind == "recovered" and item.parts[0].video.name == "part-001.mkv"
+    assert item.load_takes().takes[0].start == 0.5 and item.unfinished_recording(1) is None
+
+
+def test_everything_but_the_media_lives_in_the_project_file(tmp_path):
+    from retake.edit.edl import Edit
+
+    project = projects.Project.create(tmp_path / "P", "P")
+    source = tmp_path / "ep.md"
+    source.write_text("One two. Three four.")
+    item = project.add_script(source)
+    assert projects.sync_script(item) is None and item.snapshot == "One two. Three four."
+    log = item.load_takes()
+    log.new_take(0, 1.0, "One two.")
+    edit = Edit(source_duration=3.0)
+    edit.add(1.0, 2.0, sentence=0, take=1)
+    item.save_edit(edit)
+    project.close()
+    item = projects.Project.load(project.path).item("ep")
+    assert item.load_takes().takes[0].text == "One two." and item.load_edit().clips[0].take == 1
+    assert sorted(p.name for p in (tmp_path / "P").iterdir()) == ["P.retake", "ep", "scripts"]
+    assert list(item.folder.iterdir()) == []
+    item.project.remove_item("ep")
+    assert item.project.store.log("ep") is None and item.project.store.snapshot("ep") is None
+
+
+def test_other_files_are_not_projects(tmp_path):
+    fake = tmp_path / "old.retake"
+    fake.write_text('{"format": "retake-project"}')
+    with pytest.raises(ValueError, match="not a Retake project"):
+        projects.Project.load(fake)
 
 
 def test_projects_outside_the_projects_folder_are_found_through_recents(tmp_path):
@@ -123,3 +157,39 @@ def test_projects_outside_the_projects_folder_are_found_through_recents(tmp_path
     found = projects.items_for_source(base, source, [str(away.path)])
     assert [(p.title, i.id) for p, i in found] == [("Course", "ep1")]
     assert [row["title"] for row in projects.list_projects(base, [str(away.path), str(tmp_path / "gone.retake")])] == ["Course"]
+
+
+def test_removing_a_recording_closes_its_gap_and_keeps_the_rest(tmp_path):
+    import soundfile as sf
+    import numpy as np
+
+    from retake.edit.edl import Clip, Edit
+    from retake.project import Project
+    from retake.session.takes import COMPLETE, Marker
+
+    project = Project.create(tmp_path / "P", "P")
+    source = tmp_path / "ep.md"
+    source.write_text("One two.")
+    item = project.add_script(source)
+    for index, seconds in ((1, 10.0), (2, 5.0), (3, 8.0)):
+        audio = item.folder / f"part-{index:03d}.flac"
+        sf.write(audio, np.zeros(int(16000 * seconds), dtype=np.float32), 16000)
+        (item.folder / f"part-{index:03d}.mkv").write_bytes(b"video")
+        item.add_part(index, audio, seconds)
+    log = item.load_takes()
+    for start in (2.0, 12.0, 17.0):
+        take = log.new_take(None, start, "t")
+        take.end, take.status = start + 1.0, COMPLETE
+    log.markers.append(Marker(1, "pause", 13.0, 13.5, "pause"))
+    log.markers.append(Marker(2, "mark", 18.0, 18.0, "mark"))
+    log.save()
+    item.save_edit(Edit(clips=[Clip(1, 2.0, 3.0), Clip(2, 12.0, 13.0), Clip(3, 17.0, 18.0)], source_duration=23.0))
+
+    files = item.remove_part(2)
+
+    assert sorted(f.name for f in files) == ["part-002.flac", "part-002.mkv"]
+    assert [p.index for p in item.parts] == [1, 3] and item.parts[1].start == 10.0
+    assert [(t.start, t.end) for t in item.load_takes().takes] == [(2.0, 3.0), (12.0, 13.0)]
+    assert [(m.kind, m.start) for m in item.load_takes().markers] == [("mark", 13.0)]
+    edit = item.load_edit()
+    assert [(c.start, c.end) for c in edit.clips] == [(2.0, 3.0), (12.0, 13.0)] and edit.source_duration == 18.0

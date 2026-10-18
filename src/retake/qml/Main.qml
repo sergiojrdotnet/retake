@@ -1,4 +1,5 @@
 import QtQuick
+import QtQml.Models
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
@@ -37,6 +38,7 @@ ApplicationWindow {
             visible: app.hasProject && app.explorerVisible && app.page !== "start"
             onRenameRequested: (itemId, title) => inputDialog.ask(qsTr("Rename"), "rename", itemId, title)
             onDeleteRecordingsRequested: (itemId, title) => { deleteDialog.itemId = itemId; deleteDialog.itemTitle = title; deleteDialog.open() }
+            onDeleteRecordingRequested: (itemId, part, title) => { deletePartDialog.itemId = itemId; deletePartDialog.part = part; deletePartDialog.partTitle = title; deletePartDialog.open() }
         }
         Rectangle {
             visible: explorerPane.visible
@@ -50,7 +52,7 @@ ApplicationWindow {
             currentIndex: app.page === "start" ? 0 : app.page === "session" ? 1 : app.page === "editor" ? 2 : 3
             StartPage {}
             SessionPage { id: sessionPage }
-            EditorPage { id: editorView; objectName: "editorPage" }
+            EditorPage { id: editorView; objectName: "editorPage"; onExportRequested: (kind) => exportDialog.show(kind) }
             ProjectPage {}
         }
     }
@@ -79,6 +81,7 @@ ApplicationWindow {
     PreflightDialog { id: preflightDialog; objectName: "preflightDialog" }
     ModelsDialog { id: modelsDialog; objectName: "modelsDialog" }
     NewProjectDialog { id: newProjectDialog }
+    ExportDialog { id: exportDialog }
     RetakeDialog {
         id: deleteDialog
         property string itemId
@@ -90,9 +93,25 @@ ApplicationWindow {
             anchors.left: parent.left
             anchors.right: parent.right
             wrapMode: Text.Wrap
-            text: qsTr("Every recording, take, the edit and the exports go to the trash. The script stays, ready to record again.")
+            text: qsTr("Every recording and the exports go to the trash, and the takes and the edit are deleted. The script stays, ready to record again.")
         }
         onAccepted: app.deleteRecordings(itemId)
+    }
+    RetakeDialog {
+        id: deletePartDialog
+        property string itemId
+        property int part
+        property string partTitle
+        title: qsTr("Delete “%1”?").arg(partTitle)
+        standardButtons: Dialog.Yes | Dialog.Cancel
+        width: Math.min(parent.width - 60, 560)
+        Label {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            wrapMode: Text.Wrap
+            text: qsTr("Its audio and video go to the trash and its takes are deleted. The recordings after it move up, and the edit keeps everything else, hand edits included.")
+        }
+        onAccepted: app.deleteRecording(itemId, part)
     }
     InputDialog {
         id: inputDialog
@@ -126,7 +145,7 @@ ApplicationWindow {
     }
 
     function anyDialogOpen() {
-        return settingsDialog.opened || preflightDialog.opened || modelsDialog.opened || quitDialog.opened || inputDialog.opened || newProjectDialog.opened || deleteDialog.opened
+        return settingsDialog.opened || preflightDialog.opened || modelsDialog.opened || quitDialog.opened || inputDialog.opened || newProjectDialog.opened || deleteDialog.opened || deletePartDialog.opened || exportDialog.opened
     }
 
     Shortcut { sequences: ["?", "F1"]; context: Qt.ApplicationShortcut; onActivated: window.helpVisible = !window.helpVisible }
@@ -134,14 +153,12 @@ ApplicationWindow {
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !window.anyDialogOpen(); onActivated: window.close() }
     Shortcut { sequence: "Ctrl+Q"; context: Qt.ApplicationShortcut; onActivated: window.close() }
     Shortcut { sequence: "Ctrl+O"; context: Qt.ApplicationShortcut; enabled: !app.recording; onActivated: app.openProjectDialog() }
-    Shortcut { sequence: "Ctrl+Shift+O"; context: Qt.ApplicationShortcut; enabled: !app.recording; onActivated: app.openScriptDialog() }
-    Shortcut { sequence: "Ctrl+Shift+N"; context: Qt.ApplicationShortcut; enabled: !app.recording; onActivated: window.openNewProject() }
-    Shortcut { sequence: "Ctrl+N"; context: Qt.ApplicationShortcut; enabled: !app.recording; onActivated: app.startFree() }
+    Shortcut { sequence: "Ctrl+N"; context: Qt.ApplicationShortcut; enabled: !app.recording; onActivated: window.openNewProject() }
     Shortcut { sequence: "Ctrl+I"; context: Qt.ApplicationShortcut; enabled: !app.recording && app.hasProject; onActivated: app.importScriptsDialog() }
     Shortcut { sequence: "Ctrl+B"; context: Qt.ApplicationShortcut; enabled: app.hasProject; onActivated: app.toggleExplorer() }
     Shortcut { sequence: "Ctrl+,"; context: Qt.ApplicationShortcut; onActivated: settingsDialog.open() }
     Shortcut { sequence: "Ctrl+M"; context: Qt.ApplicationShortcut; onActivated: modelsDialog.open() }
-    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !window.helpVisible && !app.recording && app.page !== "start" && !window.anyDialogOpen(); onActivated: app.pickupPending ? app.cancelPickup() : app.goStart() }
+    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: !window.helpVisible && !app.recording && !app.finishing && app.page !== "start" && !window.anyDialogOpen(); onActivated: app.pickupPending ? app.cancelPickup() : app.closeProject() }
 
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !window.anyDialogOpen(); onActivated: app.action("toggle_pause") }
     Shortcut { sequence: "Shift+Space"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !app.recording; onActivated: app.rehearse() }
@@ -157,7 +174,6 @@ ApplicationWindow {
     Shortcut { sequence: "N"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && app.drill.active === true && !window.anyDialogOpen(); onActivated: app.action("uncoach") }
     Shortcut { sequence: "V"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !window.anyDialogOpen(); onActivated: app.cycleDisplayMode() }
     Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !app.recording && !window.anyDialogOpen(); onActivated: { app.runPreflight(); preflightDialog.open() } }
-    Shortcut { sequence: "C"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !window.anyDialogOpen(); onActivated: app.setCameraLayout(app.cameraLayout === "corner" ? "full" : app.cameraLayout === "full" ? "off" : "corner") }
     Shortcut { sequence: "Tab"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !window.anyDialogOpen(); onActivated: app.cycleLayout(1) }
     Shortcut { sequence: "Backtab"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !window.anyDialogOpen(); onActivated: app.cycleLayout(-1) }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: window.sessionPage && !window.anyDialogOpen(); onActivated: app.setLayout("full") }
@@ -171,15 +187,28 @@ ApplicationWindow {
     Shortcut { sequence: "Shift+Left"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.nudge(-5) }
     Shortcut { sequence: "Alt+Right"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.nudge(0.2) }
     Shortcut { sequence: "Alt+Left"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.nudge(-0.2) }
-    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.seek(editor.nextEdge(editorView.playhead, 1)) }
-    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.seek(editor.nextEdge(editorView.playhead, -1)) }
-    Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.cycleTake(editorView.playhead) }
+    Shortcut { sequence: "]"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.jumpEdge(1) }
+    Shortcut { sequence: "["; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.jumpEdge(-1) }
+    Instantiator {
+        model: 10
+        delegate: Shortcut {
+            required property int index
+            sequence: String(index)
+            context: Qt.ApplicationShortcut
+            enabled: window.editorPage && !window.anyDialogOpen()
+            onActivated: editorView.jumpToTenth(index)
+        }
+    }
+    Shortcut { sequence: "F"; context: Qt.ApplicationShortcut; enabled: window.editorPage && !window.anyDialogOpen(); onActivated: editor.saveFrame(editorView.playhead) }
+    Shortcut { sequence: "Ctrl+S"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.render(editor.hasVideo ? "video" : "audio") }
+    Shortcut { sequence: "T"; context: Qt.ApplicationShortcut; enabled: window.editorPage && !window.anyDialogOpen(); onActivated: editor.cycleTake(editorView.focusSentence, 1) }
+    Shortcut { sequence: "Shift+T"; context: Qt.ApplicationShortcut; enabled: window.editorPage && !window.anyDialogOpen(); onActivated: editor.cycleTake(editorView.focusSentence, -1) }
     Shortcut { sequence: "R"; context: Qt.ApplicationShortcut; enabled: window.editorPage && !window.anyDialogOpen(); onActivated: editorView.rerecord() }
     Shortcut { sequence: "S"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.split(editorView.playhead) }
     Shortcut { sequences: ["X", "Delete"]; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.removeAt(editorView.playhead) }
     Shortcut { sequence: "Ctrl+Space"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.setEdge("start", editorView.playhead) }
     Shortcut { sequence: "Alt+Space"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.setEdge("end", editorView.playhead) }
-    Shortcut { sequence: "A"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.autoEdit() }
+    Shortcut { sequence: "A"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.resetEdit() }
     Shortcut { sequence: "Z"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.toggleZoom() }
     Shortcut { sequence: "V"; context: Qt.ApplicationShortcut; enabled: window.editorPage && !window.anyDialogOpen(); onActivated: editorView.toggleView() }
     Shortcut { sequence: "Ctrl+Tab"; context: Qt.ApplicationShortcut; enabled: (window.sessionPage || window.editorPage) && !window.anyDialogOpen(); onActivated: app.toggleView() }
@@ -188,6 +217,5 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+0"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editorView.zoomFit() }
     Shortcut { sequence: "Ctrl+Z"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.undo() }
     Shortcut { sequence: "Ctrl+Shift+Z"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.redo() }
-    Shortcut { sequence: "Ctrl+S"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.save() }
-    Shortcut { sequence: "Ctrl+E"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.render(editor.hasVideo ? "video" : "narration-flac") }
+    Shortcut { sequence: "Ctrl+E"; context: Qt.ApplicationShortcut; enabled: window.editorPage; onActivated: editor.render(editor.hasVideo ? "video" : "audio") }
 }

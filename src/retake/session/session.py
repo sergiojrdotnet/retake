@@ -7,17 +7,13 @@ from typing import Protocol
 from ..languages.packs import LanguagePack
 from ..script.lexicon import Lexicon
 from ..script.normalize import hypothesis_tokens
-from ..script.model import ADLIB, CAMERA as CAMERA_CUE, SCENE as SCENE_CUE, Script, Token
+from ..script.model import ADLIB, Script
 from . import takes as kinds
 from .aligner import HypToken
 from .coach import REQUIRE, WARN, CoachSettings, PracticeHistory, flag_entry
-from .drill import COMMAND_WINDOW, LONG_ATTEMPT, PASSED, SKIPPED, UNCOACHED, Drill, DrillWord
-from .free import FreeTracker
+from .drill import COMMAND_WINDOW, LONG_ATTEMPT, ON_DEMAND_TIMES, PASSED, SKIPPED, UNCOACHED, Drill, DrillWord
 from .takes import COMPLETE, REJECTED, Take, TakeLog
 from .tracker import ScriptTracker
-
-SCRIPTED = "scripted"
-FREE = "free"
 
 READY = "ready"
 LISTENING = "listening"
@@ -30,12 +26,10 @@ RECENT = 6.0
 
 @dataclass
 class SessionSettings:
-    mode: str = SCRIPTED
     rehearsal: bool = False
     coach: CoachSettings = field(default_factory=CoachSettings)
     extra_speech: str = "between"
     deviations: str = WARN
-    punctuated_transcripts: bool = False
 
 
 class SessionListener(Protocol):
@@ -43,15 +37,13 @@ class SessionListener(Protocol):
     def position_changed(self, sentence: int, word: int) -> None: ...
     def sentence_changed(self, sentence: int) -> None: ...
     def takes_changed(self) -> None: ...
-    def transcript_changed(self, partial: str) -> None: ...
     def coach_feedback(self, take: Take, flagged: list[dict], deviations: list[dict]) -> None: ...
     def notice(self, kind: str, text: str) -> None: ...
     def request(self, message: dict) -> None: ...
-    def camera(self, layout: str) -> None: ...
-    def scene(self, name: str) -> None: ...
     def review_changed(self, queue: list[int], index: int) -> None: ...
     def drill_changed(self, drill: dict) -> None: ...
     def marks_changed(self, red: list[int], warned: list[int]) -> None: ...
+    def stop_requested(self) -> None: ...
 
 
 class Session:
@@ -60,7 +52,7 @@ class Session:
         log: TakeLog,
         settings: SessionSettings,
         listener: SessionListener,
-        script: Script | None = None,
+        script: Script,
         pack: LanguagePack | None = None,
         native: LanguagePack | None = None,
         history: PracticeHistory | None = None,
@@ -95,21 +87,16 @@ class Session:
         self._drill_marker: kinds.Marker | None = None
         self.red: dict[int, list[int]] = {}
         self.warned: dict[int, list[int]] = {}
+        # Words skipped in a drill are left alone for the rest of this recording.
+        self.skipped: set[str] = set()
         fillers = pack.fillers if pack else ()
-        if settings.mode == SCRIPTED and script is not None:
-            function_words = pack.function_words if pack else frozenset()
-            self.tracker: ScriptTracker | FreeTracker = ScriptTracker(script, log, self, fillers, function_words)
-            if start_sentence is not None and 0 <= start_sentence < len(script.sentences):
-                self.tracker.sentence = start_sentence
-        else:
-            self.tracker = FreeTracker(log, self, fillers, settings.punctuated_transcripts)
-
-    @property
-    def scripted(self) -> bool:
-        return isinstance(self.tracker, ScriptTracker)
+        function_words = pack.function_words if pack else frozenset()
+        self.tracker = ScriptTracker(script, log, self, fillers, function_words)
+        if start_sentence is not None and 0 <= start_sentence < len(script.sentences):
+            self.tracker.sentence = start_sentence
 
     def start(self) -> None:
-        if self.scripted and self.pickup:
+        if self.pickup:
             self.review_queue = list(self.pickup)
             self.review_index = 0
             self._set_state(REVIEW)
@@ -119,9 +106,8 @@ class Session:
             self.position_changed(self.tracker.sentence, -1)
             return
         self._set_state(LISTENING)
-        if self.scripted:
-            self.sentence_changed(self.tracker.sentence)
-            self.position_changed(self.tracker.sentence, -1)
+        self.sentence_changed(self.tracker.sentence)
+        self.position_changed(self.tracker.sentence, -1)
 
     def stop(self) -> None:
         if self.state == STOPPED:
@@ -130,15 +116,12 @@ class Session:
             self._end_drill()
         if self._pause_marker is not None:
             self._close_pause()
-        if self.scripted:
-            tracker = self.tracker
-            if tracker.take is not None:
-                if tracker.alignment and tracker.alignment.last_word >= len(tracker.current.words) - 1:
-                    tracker.complete()
-                else:
-                    tracker.reject("stopped")
-        else:
-            self.tracker.stop()
+        tracker = self.tracker
+        if tracker.take is not None:
+            if tracker.alignment and tracker.alignment.last_word >= len(tracker.current.words) - 1:
+                tracker.complete()
+            else:
+                tracker.reject("stopped")
         self._set_state(STOPPED)
         self.log.save()
 
@@ -185,8 +168,6 @@ class Session:
             self._on_score(event)
 
     def _tokens(self, words: list[dict]) -> list[HypToken]:
-        if not self.scripted:
-            return [HypToken(w["text"], w["start"], w["end"], w.get("conf", 1.0)) for w in words]
         numbers = self.pack.numbers if self.pack else None
         tokens = []
         for word in words:
@@ -196,7 +177,7 @@ class Session:
             span = (word["end"] - word["start"]) / len(parts)
             for index, part in enumerate(parts):
                 start = word["start"] + index * span
-                tokens.append(HypToken(part, start, start + span, word.get("conf", 1.0)))
+                tokens.append(HypToken(part, start, start + span))
         return tokens
 
     def _on_command(self, event: dict) -> None:
@@ -241,26 +222,23 @@ class Session:
             self._close_pause()
         elif action == "again":
             self._again(time, source)
-        elif action == "next" and self.scripted:
+        elif action == "next":
             self.tracker.go_next()
-        elif action == "back" and self.scripted:
+        elif action == "back":
             self.tracker.go_back()
-        elif action == "goto" and self.scripted and arg is not None:
+        elif action == "goto" and arg is not None:
             self.tracker.go_to(int(arg))
         elif action == "mark":
             self._chapters += 1
-            self.log.add_marker(kinds.CHAPTER if not self.scripted else kinds.MARK, time, time, arg or f"Mark {self._chapters}")
+            self.log.add_marker(kinds.MARK, time, time, arg or f"Mark {self._chapters}")
             self.listener.notice("mark", arg or f"Mark {self._chapters}")
         elif action == "listen":
             self._listen()
         elif action == "say" and arg:
             self.listener.request({"type": "tts", "text": str(arg), "slow": True})
-        elif action.startswith("camera_"):
-            layout = action.removeprefix("camera_")
-            self.log.add_marker(kinds.CAMERA, time, time, layout)
-            self.listener.camera(layout)
         elif action == "stop":
-            self.stop()
+            # The whole recording stops (recorder, video, the studio), the same as pressing Enter.
+            self.listener.stop_requested()
             return
         self.listener.takes_changed()
 
@@ -276,21 +254,18 @@ class Session:
     def _again(self, time: float, source: str) -> None:
         reason = "command" if source == "voice" else source
         tracker = self.tracker
-        if self.scripted:
-            if tracker.take is not None:
-                tracker.retake(reason, end=time)
-                return
-            recent = self._recent_take(time)
-            if recent is not None:
-                recent.status = REJECTED
-                recent.reason = reason
-                self.log.save()
-                self.take_rejected(recent)
-                tracker.go_to(recent.sentence)
-                return
+        if tracker.take is not None:
             tracker.retake(reason, end=time)
-        else:
-            tracker.retake(reason, end=time)
+            return
+        recent = self._recent_take(time)
+        if recent is not None:
+            recent.status = REJECTED
+            recent.reason = reason
+            self.log.save()
+            self.take_rejected(recent)
+            tracker.go_to(recent.sentence)
+            return
+        tracker.retake(reason, end=time)
 
     def _recent_take(self, time: float) -> Take | None:
         if self.last_feedback is not None:
@@ -310,13 +285,12 @@ class Session:
             entry = self.last_feedback[1][0]
             self.listener.request({"type": "tts", "text": entry["text"], "slow": True, "ipa": entry.get("expected") or None})
             return
-        if self.scripted:
-            sentence = self.tracker.current
-            if sentence.words:
-                index = min(max(self.tracker.position + 1, 0), len(sentence.words) - 1)
-                word = sentence.words[index]
-                self.listener.request({"type": "tts", "text": word.display.strip(".,;:!?"), "slow": True,
-                                       "ipa": word.override_ipa or self.lexicon.word_ipa(word.key)})
+        sentence = self.tracker.current
+        if sentence.words:
+            index = min(max(self.tracker.position + 1, 0), len(sentence.words) - 1)
+            word = sentence.words[index]
+            self.listener.request({"type": "tts", "text": word.display.strip(".,;:!?"), "slow": True,
+                                   "ipa": word.override_ipa or self.lexicon.word_ipa(word.key)})
 
     def tts_played(self, start: float, end: float, text: str) -> None:
         self.log.add_marker(kinds.TTS, start, end, text)
@@ -331,17 +305,16 @@ class Session:
 
     def sentence_changed(self, sentence: int) -> None:
         self.last_feedback = None if self.state != REVIEW else self.last_feedback
-        if self.script is not None:
-            current = self.script.sentences[sentence]
-            self.listener.request({
-                "type": "context",
-                "text": current.text if current.kind != ADLIB else "",
-                "words": [w.display.strip(".,;:!?\"'()") for w in current.words],
-            })
+        current = self.script.sentences[sentence]
+        self.listener.request({
+            "type": "context",
+            "text": current.text if current.kind != ADLIB else "",
+            "words": [w.display.strip(".,;:!?\"'()") for w in current.words],
+        })
         self.listener.sentence_changed(sentence)
 
     def take_started(self, take: Take) -> None:
-        if self.scripted and take.sentence is not None and self.script is not None:
+        if take.sentence is not None:
             section = self.script.sentences[take.sentence].section
             if section >= 0 and section != self._last_section:
                 self._last_section = section
@@ -352,33 +325,22 @@ class Session:
 
     def take_completed(self, take: Take) -> None:
         self.listener.takes_changed()
-        is_adlib = self.script is not None and take.sentence is not None and self.script.sentences[take.sentence].kind == ADLIB
+        is_adlib = take.sentence is not None and self.script.sentences[take.sentence].kind == ADLIB
         if is_adlib:
             self.log.add_marker(kinds.ADLIB, take.start, take.end, "ad-lib")
         else:
             if self.settings.coach.enabled and take.words:
                 self._request_score(take)
-            if self.scripted and take.deviations:
+            if take.deviations:
                 self._apply_deviations(take)
         if self.state == REVIEW:
             if take.sentence == self.review_queue[self.review_index]:
                 self._advance_review()
-        elif self.scripted and self.script is not None and self.script.next_sentence(take.sentence) is None:
+        elif self.script.next_sentence(take.sentence) is None:
             self._end_of_script()
 
     def take_rejected(self, take: Take) -> None:
         self.listener.takes_changed()
-
-    def transcript_changed(self, partial: str) -> None:
-        self.listener.transcript_changed(partial)
-
-    def cue_reached(self, token: Token, time: float) -> None:
-        if token.kind == CAMERA_CUE:
-            self.log.add_marker(kinds.CAMERA, time, time, token.value)
-            self.listener.camera(token.value)
-        elif token.kind == SCENE_CUE:
-            self.log.add_marker(kinds.SCENE, time, time, token.value)
-            self.listener.scene(token.value)
 
     def off_script(self, start: float, end: float, text: str, inside: bool, filler: bool) -> None:
         kind = kinds.FILLER if filler else kinds.OFF_SCRIPT
@@ -393,7 +355,7 @@ class Session:
         for timing in take.words:
             override = None
             text = timing.text
-            if self.script is not None and timing.word >= 0:
+            if timing.word >= 0:
                 word = self.script.words[timing.word]
                 override = word.override_ipa or self.lexicon.word_ipa(word.key)
                 text = word.spoken or word.display
@@ -417,7 +379,7 @@ class Session:
         return key in self.history.uncoached() or self.lexicon.uncoached(key)
 
     def _word_key(self, index: int, text: str) -> str:
-        if self.script is not None and 0 <= index < len(self.script.words):
+        if 0 <= index < len(self.script.words):
             return self.script.words[index].key
         return text.lower().strip(".,;:!?\"'()[]")
 
@@ -452,7 +414,7 @@ class Session:
         take.flagged = flagged
         self.history.save()
         self.log.save()
-        failing = [e for e in flagged if coach.require and e["score"] < coach.require]
+        failing = [e for e in flagged if coach.require and e["score"] < coach.require and self._word_key(e["word"], e["text"]) not in self.skipped]
         self._set_marks(take.sentence, [e["word"] for e in failing], [e["word"] for e in flagged if e not in failing])
         if not flagged:
             self.listener.takes_changed()
@@ -460,14 +422,12 @@ class Session:
         if coach.timing == "review":
             if take.sentence is not None and take.sentence not in self.review_queue:
                 self.review_queue.append(take.sentence)
-            if not self.scripted:
-                self.tracker.targets.append(take)
             self.listener.takes_changed()
             return
         self.last_feedback = (take, flagged)
         self.listener.coach_feedback(take, flagged, [])
         if failing and take.status == COMPLETE:
-            if self.scripted and coach.drill and self.drill is None:
+            if coach.drill_times > 0 and self.drill is None:
                 self._start_drill(take, failing)
             else:
                 self._send_back(take, "coach")
@@ -488,16 +448,14 @@ class Session:
     def _drill_on_demand(self) -> None:
         """Drills the words of the current sentence that were warned about, or of the previous one
         when the current has none; the sentence is then read again."""
-        if not self.scripted:
-            return
         current = self.tracker.sentence
-        previous = self.script.previous_sentence(current) if self.script is not None else None
+        previous = self.script.previous_sentence(current)
         for sentence in (current, previous):
             if sentence is None:
                 continue
             marked = set(self.red.get(sentence, [])) | set(self.warned.get(sentence, []))
             take = next((t for t in reversed(self.log.takes) if t.sentence == sentence and t.flagged), None)
-            entries = [e for e in take.flagged if e.get("word") in marked] if take and marked else []
+            entries = [e for e in take.flagged if e.get("word") in marked and self._word_key(e.get("word", -1), e.get("text", "")) not in self.skipped] if take and marked else []
             if entries:
                 self._start_drill(take, entries, reason="drill", interrupt=True)
                 return
@@ -517,11 +475,11 @@ class Session:
         words = []
         for entry in sorted(failing, key=lambda e: e.get("word", -1)):
             index = entry.get("word", -1)
-            script_word = self.script.words[index] if self.script is not None and 0 <= index < len(self.script.words) else None
+            script_word = self.script.words[index] if 0 <= index < len(self.script.words) else None
             text = (script_word.spoken or script_word.display) if script_word else entry.get("text", "")
             override = (script_word.override_ipa or self.lexicon.word_ipa(script_word.key)) if script_word else None
             words.append(DrillWord(index, text.strip(".,;:!?\"'()[]"), self._word_key(index, text), override, entry))
-        self.drill = Drill(take, words, max(1, int(self.settings.coach.drill_times)))
+        self.drill = Drill(take, words, int(self.settings.coach.drill_times) or ON_DEMAND_TIMES)
         self._drill_marker = self.log.add_marker(kinds.DRILL, self.now, self.now, "drill")
         self._say_drill_word()
 
@@ -582,6 +540,8 @@ class Session:
     def _next_drill_word(self, outcome: str) -> None:
         drill = self.drill
         index = drill.word.index
+        if outcome == SKIPPED:
+            self.skipped.add(drill.word.key)
         drill.finish_word(outcome)
         self.log.save()
         if outcome == UNCOACHED:
@@ -594,7 +554,7 @@ class Session:
             self._say_drill_word()
 
     def _end_drill(self) -> None:
-        drill, self.drill = self.drill, None
+        self.drill = None
         if self._drill_marker is not None:
             self._drill_marker.end = self.now
             self._drill_marker = None
@@ -629,11 +589,10 @@ class Session:
         take.status = REJECTED
         take.reason = reason
         self.log.save()
-        if self.scripted:
-            tracker = self.tracker
-            if tracker.take is not None and tracker.take.start >= (take.end or 0):
-                tracker.reject(reason)
-            tracker.go_to(take.sentence)
+        tracker = self.tracker
+        if tracker.take is not None and tracker.take.start >= (take.end or 0):
+            tracker.reject(reason)
+        tracker.go_to(take.sentence)
         self.listener.notice("retake", reason)
 
     def _end_of_script(self) -> None:

@@ -115,8 +115,7 @@ Item {
         onClicked: (mouse) => {
             if (mouse.button === Qt.RightButton && item.prompter && item.prompter.openWordMenu) item.prompter.openWordMenu(item.token)
             else if (mouse.button === Qt.RightButton) app.listenTo(item.token.text.replace(/[.,;:!?"'()]/g, ""))
-            else app.toggleFlag(item.token.word)
+            else app.jumpTo(item.token.sentence)
         }
-        onDoubleClicked: app.jumpTo(item.token.sentence)
     }
 }

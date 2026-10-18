@@ -52,10 +52,8 @@ Item {
             columnSpacing: 14
             rowSpacing: 14
             Layout.fillWidth: true
-            BigButton { title: qsTr("New project"); hint: "Ctrl+Shift+N"; detail: qsTr("A course or series; import its scripts"); onClicked: window.openNewProject() }
-            BigButton { title: qsTr("Quick project from a script"); hint: "Ctrl+Shift+O"; detail: qsTr("Pick a Markdown script and start recording"); onClicked: app.openScriptDialog() }
+            BigButton { title: qsTr("New project"); hint: "Ctrl+N"; detail: qsTr("A course or series; import its scripts"); onClicked: window.openNewProject() }
             BigButton { title: qsTr("Open project"); hint: "Ctrl+O"; detail: qsTr("A .retake file"); onClicked: app.openProjectDialog() }
-            BigButton { title: qsTr("Free recording"); hint: "Ctrl+N"; detail: qsTr("No script, just talk"); onClicked: app.startFree() }
         }
 
         ColumnLayout {

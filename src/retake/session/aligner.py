@@ -19,7 +19,6 @@ class HypToken:
     text: str
     start: float
     end: float
-    conf: float = 1.0
 
 
 @dataclass(frozen=True)

@@ -19,7 +19,7 @@ def test_parses_sections_cues_and_adlib():
     assert script.title == "Event Store Study Case"
     assert [s.title for s in script.sections] == ["Event Store Study Case", "Introduction"]
     first = script.sentences[0]
-    assert kinds(first)[0] == "scene" and first.tokens[0].value == "Camera"
+    assert kinds(first)[0] == "cue" and first.tokens[0].text == "On camera"
     assert script.sentences[1].words[2].emphasis
     assert any(t.kind == "cue" and t.text == "SMILE" for t in script.sentences[2].tokens)
     assert any(w.override_ipa == "kæʃ" for w in script.sentences[2].words)
@@ -69,8 +69,8 @@ def test_guides_render_three_ways():
 def test_guide_scope_and_lexicon(tmp_path):
     script_file = tmp_path / "talk.md"
     script_file.write_text("We deploy Kubernetes clusters.")
+    (tmp_path / "talk.lexicon.tsv").write_text("kubernetes\tkuːbərˈnɛtiːz\n")
     lexicon = Lexicon.for_script(script_file)
-    lexicon.set_ipa("kubernetes", "kuːbərˈnɛtiːz")
     lexicon.set_flag("deploy", True)
     reloaded = Lexicon.for_script(script_file)
     assert reloaded.is_flagged("deploy")
@@ -84,11 +84,11 @@ def test_guide_scope_and_lexicon(tmp_path):
 
 
 def test_preflight_flags_wake_word_and_unknown_words():
-    script = parse("Say retake now. The zxqvly thing (SCENE: Demo).", packs.get("en"))
+    script = parse("Say retake now. The zxqvly thing.", packs.get("en"))
     book = GuideBuilder(packs.get("en"), packs.get("pt-BR")).build(script)
-    issues = preflight.check(script, book, packs.get("en"), "retake", "builtin")
+    issues = preflight.check(script, book, packs.get("en"), "retake")
     found = {i.kind for i in issues}
-    assert {"wake-word", "pronunciation", "cue"} <= found
+    assert {"wake-word", "pronunciation"} <= found
 
 
 def test_possessives_reuse_the_base_entry(tmp_path):
@@ -110,5 +110,19 @@ def test_preflight_trusts_lexicon_readings(tmp_path):
     lexicon = Lexicon.for_script(script_file)
     script = parse_file(script_file, packs.get("en"), lexicon)
     book = GuideBuilder(packs.get("en"), packs.get("pt-BR"), lexicon).build(script)
-    flagged = {i.word for i in preflight.check(script, book, packs.get("en"), "retake", "builtin") if i.kind == "heteronym"}
+    flagged = {i.word for i in preflight.check(script, book, packs.get("en"), "retake") if i.kind == "heteronym"}
     assert "read" in flagged and "live" not in flagged
+
+
+def test_plain_text_scripts_have_no_markup_but_use_the_lexicon(tmp_path):
+    script_file = tmp_path / "notes.txt"
+    script_file.write_text("# Not a heading. We read [this] and {that|x} too.\nStill the same paragraph // here.\n\nThe tikv cluster grew. Dr. Smith agreed!\n")
+    (tmp_path / "notes.lexicon.tsv").write_text("tikv\t\t\ttie kay vee\n")
+    script = parse_file(script_file, packs.get("en"))
+    assert script.title == "notes" and script.sections == [] and len(script.paragraphs) == 2
+    assert [s.text for s in script.sentences] == [
+        "Not a heading.", "We read [this] and {that|x} too.", "Still the same paragraph here.", "The tikv cluster grew.", "Dr. Smith agreed!",
+    ]
+    assert script.sentences[0].tokens[0].text == "#" and script.sentences[0].tokens[0].kind == "text"
+    tikv = next(w for w in script.words if w.display == "tikv")
+    assert ["tie", "kay", "vee"] in tikv.variants

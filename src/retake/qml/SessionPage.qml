@@ -8,7 +8,9 @@ Item {
     property bool strip: panels.strip === true
     // The coach panel only says "off" when the coach is disabled; its room goes to the takes instead.
     property bool coachShown: panels.coach === true && app.settings.coach.enabled === true
-    property bool sidebar: !strip && (coachShown || panels.takes || panels.camera === true)
+    // No camera chosen in Settings → Recording: no camera panel.
+    property bool cameraShown: panels.camera === true && app.cameraSource !== "none"
+    property bool sidebar: !strip && (coachShown || panels.takes || cameraShown)
 
     RowLayout {
         anchors.fill: parent
@@ -21,11 +23,7 @@ Item {
 
             Prompter {
                 anchors.fill: parent
-                visible: !page.strip && app.hasScript
-            }
-            TranscriptPanel {
-                anchors.fill: parent
-                visible: !page.strip && !app.hasScript
+                visible: !page.strip
             }
             CardView {
                 anchors.fill: parent
@@ -47,7 +45,7 @@ Item {
 
             Panel {
                 title: qsTr("Camera")
-                visible: page.panels.camera === true
+                visible: page.cameraShown
                 Layout.fillWidth: true
                 // Portrait phone recordings get a tall panel so the preview keeps the recording's shape.
                 Layout.preferredHeight: (app.phonePortrait ? Math.min(width * 16 / 9, page.height * 0.72) : width * 9 / 16) + 34

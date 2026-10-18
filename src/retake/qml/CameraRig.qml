@@ -1,20 +1,20 @@
 import QtQuick
-import QtQuick.Window
 import QtMultimedia
 
+// The camera chosen in Settings → Recording (any video device but the phone): it feeds the camera
+// panel and records the part's video, with the microphone for lining it up with the audio.
 Item {
     id: rig
-    property string backend: app.videoBackend
-    property bool wanted: !app.phoneMode && app.page === "session" && (backend === "builtin" || backend === "camera" || app.panels.camera === true)
-    property alias output: windowOutput
+    property bool wanted: app.cameraSource === "device" && app.page === "session"
+    property alias output: frames
     property bool hasCamera: app.cameraAllowed && devices.videoInputs.length > 0
 
     MediaDevices { id: devices }
 
     function pickDevice() {
-        const wantedPath = app.settings.video.camera_device || ""
+        const wanted = app.settings.camera.device || ""
         for (const device of devices.videoInputs) {
-            if (wantedPath && (String(device.id) === wantedPath || device.description === wantedPath))
+            if (wanted && (String(device.id) === wanted || device.description === wanted))
                 return device
         }
         return devices.defaultVideoInput
@@ -57,8 +57,8 @@ Item {
     CaptureSession {
         id: capture
         camera: camera
-        videoOutput: windowOutput
-        audioInput: rig.backend === "camera" ? audio : null
+        videoOutput: frames
+        audioInput: audio
         recorder: MediaRecorder {
             id: recorder
             // Qt's bundled FFmpeg has no software H.264 encoder, and some GPUs refuse the
@@ -89,7 +89,7 @@ Item {
                     attempt += 1
                     retryPending = true
                     if (codecs[attempt] === MediaFormat.VideoCodec.H265)
-                        app.setSetting("video", "camera_codec", "h265")
+                        app.setSetting("camera", "codec", "h265")
                     if (recorderState === MediaRecorder.StoppedState) {
                         retryPending = false
                         record()
@@ -109,7 +109,7 @@ Item {
         target: app
         function onCameraRecord(path) {
             recorder.stopping = false
-            recorder.attempt = app.settings.video.camera_codec === "h265" ? 1 : 0
+            recorder.attempt = app.settings.camera.codec === "h265" ? 1 : 0
             recorder.outputLocation = "file://" + path
             recorder.record()
         }
@@ -117,22 +117,12 @@ Item {
             recorder.stopping = true
             recorder.stop()
         }
-        function onCameraChanged() { if (cameraWindow.visible) app.placeCamera() }
     }
 
-    Window {
-        id: cameraWindow
-        title: "Retake camera"
-        width: 480
-        height: 270
-        color: "black"
-        flags: Qt.Window | Qt.FramelessWindowHint | Qt.WindowDoesNotAcceptFocus
-        visible: rig.wanted && rig.backend === "builtin" && app.cameraLayout !== "off" && rig.hasCamera
-        onVisibleChanged: if (visible) app.placeCamera()
-        VideoOutput {
-            id: windowOutput
-            anchors.fill: parent
-            fillMode: VideoOutput.PreserveAspectCrop
-        }
+    // Never shown: the camera panel copies its frames (app.forwardFrames), so the camera keeps
+    // running while the layout swaps panels in and out.
+    VideoOutput {
+        id: frames
+        visible: false
     }
 }

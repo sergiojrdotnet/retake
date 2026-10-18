@@ -9,7 +9,7 @@ SCRIPT = """
 
 We flush the cache to disk. Then we measure P99 latency at 10k events.
 
-(SCENE: Terminal) Finally we compare 2026 results.
+[On the terminal] Finally we compare 2026 results.
 
 (AD-LIB)
 talk freely
@@ -88,7 +88,7 @@ def test_restart_rejects_partial_take():
     assert log.takes[0].reason == "restart"
 
 
-def test_retake_command_and_scene_cue():
+def test_retake_command_redoes_the_sentence():
     script, log, events, tracker = make()
     t = speak(tracker, "we flush the cache to disk", 0.0)
     t = speak(tracker, "then we measure p ninety nine latency at ten k events", t)
@@ -97,8 +97,6 @@ def test_retake_command_and_scene_cue():
     t = speak(tracker, "finally we compare twenty twenty six results", t)
     statuses = [(take.sentence, take.status) for take in log.takes]
     assert statuses[-2:] == [(2, REJECTED), (2, COMPLETE)]
-    scenes = [args[0].value for args in events.of("cue_reached")]
-    assert scenes == ["Terminal"]
 
 
 def test_adlib_then_next_sentence():

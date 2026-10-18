@@ -7,8 +7,6 @@ from pathlib import Path
 WORD = "word"
 CUE = "cue"
 PAUSE = "pause"
-SCENE = "scene"
-CAMERA = "camera"
 TEXT = "text"
 
 SPOKEN = "spoken"
@@ -61,25 +59,6 @@ class Sentence:
     @property
     def trackable(self) -> bool:
         return self.kind == SPOKEN and bool(self.words)
-
-    def cues_after(self, position: int) -> list[Token]:
-        seen = -1
-        result = []
-        for token in self.tokens:
-            if token.kind == WORD:
-                seen = token.word.position
-            elif token.kind in (SCENE, CAMERA) and seen == position:
-                result.append(token)
-        return result
-
-    def leading_cues(self) -> list[Token]:
-        result = []
-        for token in self.tokens:
-            if token.kind == WORD:
-                break
-            if token.kind in (SCENE, CAMERA):
-                result.append(token)
-        return result
 
 
 @dataclass

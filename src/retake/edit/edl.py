@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 import copy
-import json
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
-
-from ..script.lexicon import atomic_write
 
 MIN_CLIP = 0.05
 
@@ -29,11 +25,12 @@ class Clip:
 class Edit:
     clips: list[Clip] = field(default_factory=list)
     source_duration: float = 0.0
-    order: str = "source"
     crossfade_ms: int = 15
     camera_crossfade_ms: int = 0
     rules: dict = field(default_factory=dict)
     next_id: int = 1
+    # The clips of takes switched out of the edit, by take id, so switching back restores their trims.
+    alternates: dict[str, list[dict]] = field(default_factory=dict)
 
     def add(self, start: float, end: float, **fields) -> Clip:
         clip = Clip(self.next_id, max(0.0, start), min(end, self.source_duration or end), **fields)
@@ -45,26 +42,18 @@ class Edit:
     def normalize(self) -> None:
         self.clips = [c for c in self.clips if c.end - c.start >= MIN_CLIP]
         self.clips.sort(key=lambda c: (c.start, c.id))
-        merged: list[Clip] = []
-        for clip in self.clips:
-            if merged and clip.start < merged[-1].end - 1e-6 and self.order == "source":
-                previous = merged[-1]
-                previous.end = max(previous.end, clip.end)
-                continue
-            merged.append(clip)
-        self.clips = merged
 
     def timeline(self) -> list[Clip]:
-        if self.order != "script":
-            return list(self.clips)
+        """The clips in the order they play: the script's, whenever and in whichever recording each
+        sentence was read. A clip that isn't a sentence's follows the sentence before it."""
         anchored: list[tuple[float, float, int, Clip]] = []
         last_sentence = -1.0
         for clip in self.clips:
             if clip.sentence is not None:
                 last_sentence = clip.sentence
-                anchored.append((float(clip.sentence), 0.0, clip.id, clip))
+                anchored.append((float(clip.sentence), clip.start, clip.id, clip))
             else:
-                anchored.append((last_sentence, 1.0 + clip.start, clip.id, clip))
+                anchored.append((last_sentence + 0.5, clip.start, clip.id, clip))
         return [entry[3] for entry in sorted(anchored, key=lambda e: (e[0], e[1], e[2]))]
 
     @property
@@ -89,13 +78,6 @@ class Edit:
             offset += clip.duration
         return None
 
-    def to_source(self, output_time: float) -> float | None:
-        offset = 0.0
-        for clip in self.timeline():
-            if offset <= output_time <= offset + clip.duration:
-                return clip.start + output_time - offset
-            offset += clip.duration
-        return None
 
     def split(self, source_time: float) -> bool:
         clip = self.clip_at(source_time)
@@ -129,10 +111,6 @@ class Edit:
             clip.end = max(min(source_time, limit), clip.start + MIN_CLIP)
         return True
 
-    def replace_take(self, sentence: int, start: float, end: float, take: int) -> None:
-        self.clips = [c for c in self.clips if c.sentence != sentence]
-        self.add(start, end, take=take, sentence=sentence, kind="take")
-
     def edges(self) -> list[float]:
         points = set()
         for clip in self.clips:
@@ -148,13 +126,6 @@ class Edit:
         clips = [Clip(**c) for c in data.get("clips", [])]
         fields = {k: v for k, v in data.items() if k != "clips"}
         return cls(clips=clips, **fields)
-
-    def save(self, path: Path) -> None:
-        atomic_write(path, json.dumps(self.as_dict(), indent=1))
-
-    @classmethod
-    def load(cls, path: Path) -> Edit:
-        return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
 class History:

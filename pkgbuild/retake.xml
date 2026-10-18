@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
   <mime-type type="application/x-retake-project">
-    <sub-class-of type="application/json"/>
+    <sub-class-of type="application/vnd.sqlite3"/>
     <comment>Retake project</comment>
     <icon name="retake"/>
     <glob pattern="*.retake"/>
+    <magic priority="60">
+      <match type="string" offset="0" value="SQLite format 3">
+        <match type="big32" offset="68" value="0x52544B31"/>
+      </match>
+    </magic>
   </mime-type>
 </mime-info>

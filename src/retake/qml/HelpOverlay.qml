@@ -9,8 +9,8 @@ Rectangle {
 
     // [what it does, key, voice actions from the language pack]
     property var sessionKeys: [
-        [qsTr("Record / pause / resume"), "Space", ["pause", "resume"]],
-        [qsTr("Rehearse (nothing is kept)"), "Shift+Space", []],
+        [qsTr("Record / pause / resume"), "Space", ["record", "pause", "resume"]],
+        [qsTr("Rehearse (nothing is kept)"), "Shift+Space", ["rehearse"]],
         [qsTr("Retake the sentence"), "R", ["again"]],
         [qsTr("Next sentence"), "→  PgDn", ["next"]],
         [qsTr("Previous sentence"), "←  PgUp", ["back"]],
@@ -21,12 +21,11 @@ Rectangle {
         [qsTr("Drill the warned words (this sentence, or the last)"), "D", ["drill"]],
         [qsTr("Word drill: skip this word"), "S", ["skip"]],
         [qsTr("Word drill: never coach this word"), "N", ["uncoach"]],
-        [qsTr("Camera: corner, full, off"), "C", ["camera_corner", "camera_full", "camera_off"]],
         [qsTr("Stop and open the editor"), "Enter", ["stop"]],
         [qsTr("Prompter mode: scroll, step, card, page"), "V", []],
         [qsTr("Layout: full, focus, lens"), "Tab  1–3", []],
         [qsTr("Check the script"), "P", []],
-        [qsTr("Flag  ·  right-click: listen, coach  ·  double-click jumps"), qsTr("Click word"), []],
+        [qsTr("Move the prompter to its sentence  ·  right-click: listen, flag, coach"), qsTr("Click word"), []],
     ]
 
     function phrases(actions) {
@@ -47,35 +46,34 @@ Rectangle {
     }
 
     property var editorKeys: [
-        ["Space", qsTr("Play / pause")],
+        ["Space", qsTr("Play / pause (through the cuts when they show)")],
         ["←  →", qsTr("Move 1 s (Shift 5 s, Alt 0.2 s)")],
-        ["[  ]", qsTr("Previous / next edge or marker")],
+        ["[  ]", qsTr("Previous / next edge or marker, in timeline order")],
+        ["0–9", qsTr("Jump to 0–90% of the edit")],
         [qsTr("Click clip"), qsTr("Select its sentence (Shift range, Ctrl add)")],
         ["R", qsTr("Re-record the selected sentences (pickups)")],
-        ["T", qsTr("Next take for this sentence")],
+        ["T  Shift+T", qsTr("Older / newer take of this sentence (or click one in the side panel)")],
         ["S", qsTr("Split at the playhead")],
         ["X  Del", qsTr("Remove clip, or restore a gap")],
         ["Ctrl+Space", qsTr("Clip start to playhead")],
         ["Alt+Space", qsTr("Clip end to playhead")],
-        ["A", qsTr("Auto edit")],
+        ["A", qsTr("Reset to the automatic cut")],
         ["Z", qsTr("Zoom to clip / out")],
-        ["V", qsTr("Edit view / whole recording with removed parts")],
+        ["V", qsTr("Show each take whole, its cuts greyed")],
         ["Ctrl+=  Ctrl+-  Ctrl+0", qsTr("Zoom in / out / fit (Ctrl+wheel at the mouse)")],
         ["Ctrl+Z  Ctrl+Shift+Z", qsTr("Undo / redo")],
-        ["Ctrl+S", qsTr("Save the edit")],
-        ["Ctrl+E", qsTr("Render")],
+        ["F", qsTr("Save the frame under the playhead as a PNG (out/)")],
+        ["Ctrl+E  Ctrl+S", qsTr("Export again with the last choices")],
     ]
     property var globalKeys: [
-        ["Ctrl+Shift+N", qsTr("New project")],
-        ["Ctrl+Shift+O", qsTr("Quick project from a script")],
+        ["Ctrl+N", qsTr("New project")],
         ["Ctrl+O", qsTr("Open project")],
         ["Ctrl+I", qsTr("Import scripts")],
-        ["Ctrl+N", qsTr("Free recording")],
         ["Ctrl+Tab", qsTr("Switch between Record and Studio")],
         ["Ctrl+B", qsTr("Show / hide the explorer")],
         ["Ctrl+,", qsTr("Settings")],
         ["Ctrl+M", qsTr("Models")],
-        ["Esc", qsTr("Back to start")],
+        ["Esc", qsTr("Close the project")],
         ["?", qsTr("This help")],
         ["Q", qsTr("Quit")],
     ]
@@ -156,13 +154,6 @@ Rectangle {
         Label {
             visible: overlay.page === "session" && app.voiceCommands.enabled
             text: qsTr("Pause briefly before the wake word. Commands and their wake word live in the language pack; change the wake word in Settings → Controls.")
-            wrapMode: Text.Wrap
-            Layout.fillWidth: true
-            opacity: 0.6
-        }
-        Label {
-            visible: overlay.page === "session" && app.hyprlandAvailable
-            text: qsTr("Hyprland: bind keys to “retake ctl next” etc. to control Retake while another window has focus (Settings → Controls).")
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             opacity: 0.6

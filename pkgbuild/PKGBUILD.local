@@ -15,10 +15,8 @@ depends=(
 optdepends=(
   'python-pytorch: Silero speech detection and pronunciation scoring on the CPU'
   'python-pytorch-cuda: Silero and pronunciation scoring on NVIDIA GPUs'
-  'gpu-screen-recorder: screen + camera recording'
   'scrcpy: Android phone as camera'
   'python-nvidia-ml-py: NVIDIA GPU monitoring'
-  'python-websockets: OBS control'
   'python-evdev: exclusive foot pedal input'
 )
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'qt6-tools')

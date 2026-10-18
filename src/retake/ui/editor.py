@@ -1,35 +1,28 @@
 from __future__ import annotations
 
-import json
+import subprocess
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Property, QObject, QUrl, Signal, Slot
+from PySide6.QtCore import Property, QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 
 from .. import config as config_module
 from .. import paths
 from ..edit import exports, media
-from ..edit.autoedit import Rules, auto_edit, flag_screen_changes
+from ..edit.autoedit import Rules, auto_edit, take_blocks, take_choices, use_take
 from ..edit.edl import Edit, History
-from ..edit.render import RenderJob, render_with_fallback
+from ..edit import outputs
+from ..edit import render as render_module
 from ..project import Item
-from ..session.takes import COMPLETE, TakeLog
+from ..session import takes as kinds
+from ..session.takes import TakeLog
 from .waveform import publish_peaks
-
-RENDER_TARGETS = {
-    "video": "video.mp4",
-    "video-hevc": "video-hevc.mp4",
-    "narration-flac": "narration.flac",
-    "narration-wav": "narration.wav",
-    "narration-opus": "narration.opus",
-    "narration-mp3": "narration.mp3",
-}
-
 
 class EditorController(QObject):
     loadedChanged = Signal()
     editChanged = Signal()
+    resetChanged = Signal()
     mediaChanged = Signal()
     renderChanged = Signal()
     message = Signal(str, str)
@@ -37,7 +30,6 @@ class EditorController(QObject):
     _thumbsReady = Signal("QVariant")
     _renderDone = Signal(str, str)
     _renderProgress = Signal(float)
-    _changesReady = Signal("QVariant")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -51,14 +43,16 @@ class EditorController(QObject):
         self._peaks_key = ""
         self._thumbs: list = []
         self._dirty = False
+        # Changes are written shortly after they're made, so a burst of trims is one write.
+        self._autosave = QTimer(self, singleShot=True, interval=400)
+        self._autosave.timeout.connect(self.save)
         self._rendering = False
         self._render_progress = 0.0
-        self._screen_flags: list = []
+        self._probe_cache: dict = {}
         self._peaksReady.connect(self._on_peaks)
         self._thumbsReady.connect(self._on_thumbs)
         self._renderDone.connect(self._on_render_done)
         self._renderProgress.connect(self._on_render_progress)
-        self._changesReady.connect(self._on_changes)
 
     @property
     def edit(self) -> Edit | None:
@@ -79,24 +73,28 @@ class EditorController(QObject):
         self.script = item.load_script()
         self.part_list = item.parts
         self.duration = item.duration
-        edit = Edit.load(item.edit_path) if item.edit_path.exists() else None
-        if edit is None:
+        edit = item.load_edit()
+        fresh = edit is None
+        if fresh:
             edit = self._auto()
         edit.source_duration = self.duration
-        if self._multipart():
-            edit.order = "script"
         self.history = History(edit)
-        self._dirty = False
+        self._dirty = fresh and bool(self.part_list)
+        if self._dirty:
+            self.save()
         self._thumbs = []
-        self._screen_flags = []
         self.loadedChanged.emit()
         self.editChanged.emit()
+        self.resetChanged.emit()
         self.mediaChanged.emit()
         threading.Thread(target=self._compute_peaks, args=(item.folder, list(self.part_list), self.duration), daemon=True).start()
         if self.has_video:
             threading.Thread(target=self._compute_thumbs, args=(item, list(self.part_list)), daemon=True).start()
+            # Trying the GPU encoders takes a moment; done now, the Video export dialog opens without a stall.
+            threading.Thread(target=lambda: [render_module.video_encoder(codec) for codec in render_module.VIDEO_ENCODERS], daemon=True).start()
 
     def unload(self) -> None:
+        self.save()
         self.item = None
         self.directory = None
         self.log = None
@@ -106,16 +104,9 @@ class EditorController(QObject):
         self.editChanged.emit()
         self.mediaChanged.emit()
 
-    def _multipart(self) -> bool:
-        return len(self.part_list) > 1 and self.item is not None and self.item.kind == "script"
-
     def rules(self) -> Rules:
         config = config_module.load()
-        rules = Rules.from_config(config["edit"], config["strictness"])
-        if self._multipart():
-            # Recordings and pickups made on different days only line up in script order.
-            rules.order = "script"
-        return rules
+        return Rules.from_config(config["edit"], config["strictness"])
 
     def _auto(self) -> Edit:
         return auto_edit(self.log, self.duration, self.rules(), self.item.boundaries() if self.item else [])
@@ -180,47 +171,33 @@ class EditorController(QObject):
     def _changed(self) -> None:
         self._dirty = True
         self.editChanged.emit()
+        self.resetChanged.emit()
+        self._autosave.start()
+
+    def _is_automatic(self) -> bool:
+        """Whether the edit is what the takes and the current rules would give anyway: then a reset
+        has nothing to do."""
+        if self.edit is None or self.log is None or not self.part_list:
+            return True
+
+        def shape(edit: Edit) -> list:
+            return [(round(c.start, 3), round(c.end, 3), c.take, c.kind) for c in sorted(edit.clips, key=lambda c: (c.start, c.id))]
+
+        return shape(self._auto()) == shape(self.edit)
 
     def _checkpoint(self) -> None:
         if self.history:
             self.history.checkpoint()
 
     @Slot()
-    def autoEdit(self) -> None:
-        if self.log is None:
+    def resetEdit(self) -> None:
+        """Back to the automatic cut with the current rules; Ctrl+Z brings the hand edits back."""
+        if self.log is None or self._is_automatic():
             return
         self._checkpoint()
         self.history.edit = self._auto()
         self._changed()
-        self.message.emit("info", f"Auto edit: kept {len(self.edit.clips)} clips, {self.edit.duration:.1f} s of {self.duration:.1f} s recorded")
-        if self.has_video:
-            threading.Thread(target=self._detect_screen_changes, daemon=True).start()
-
-    def _detect_screen_changes(self) -> None:
-        edit = self.edit
-        clips = sorted(edit.clips, key=lambda c: c.start)
-        changes = []
-        for part in self.part_list:
-            if part.video is None:
-                continue
-            from ..edit.trim import offset_at
-
-            def video_time(t: float) -> float:
-                local = t - part.start
-                return local - offset_at(list(part.video_segments), part.video_offset, local)
-
-            gaps = [(video_time(a.end), video_time(b.start)) for a, b in zip(clips, clips[1:]) if b.start - a.end > 1.0 and part.start <= a.end and b.start <= part.end]
-            try:
-                changes += [part.start + self._audio_time(part, t) for t in media.screen_changes(part.video, gaps) if self._audio_time(part, t) is not None]
-            except Exception:
-                continue
-        self._changesReady.emit([{"start": a, "end": b} for a, b in flag_screen_changes(edit, changes)])
-
-    def _on_changes(self, flags) -> None:
-        self._screen_flags = flags
-        if flags:
-            self.message.emit("info", f"{len(flags)} cut(s) skip screen activity; check them before rendering")
-        self.editChanged.emit()
+        self.message.emit("info", f"Edit reset: kept {len(self.edit.clips)} clips, {self.edit.duration:.1f} s of {self.duration:.1f} s recorded (Ctrl+Z undoes)")
 
     def apply_recording(self, sentences: set[int]) -> list[int]:
         """After a new part: swap in its takes for these sentences, keeping every other edit."""
@@ -230,8 +207,6 @@ class EditorController(QObject):
             return []
         self._checkpoint()
         updated = update_sentences(self.edit, self.log, sentences, self.rules(), self.duration, self.item.boundaries())
-        if self._multipart():
-            self.edit.order = "script"
         self._changed()
         return updated
 
@@ -247,12 +222,12 @@ class EditorController(QObject):
 
     @Slot()
     def save(self) -> None:
-        if self.item and self.edit:
-            self.edit.save(self.item.edit_path)
-            self.log.save()
+        self._autosave.stop()
+        if self._dirty and self.item and self.edit:
+            with self.item.project.store.batch():
+                self.item.save_edit(self.edit)
+                self.log.save()
             self._dirty = False
-            self.editChanged.emit()
-            self.message.emit("info", "Edit saved")
 
     @Slot(float)
     def split(self, t: float) -> None:
@@ -290,29 +265,73 @@ class EditorController(QObject):
         clips = self.edit.clips
         return min(clips, key=lambda c: min(abs(c.start - t), abs(c.end - t))) if clips else None
 
-    @Slot(float)
-    def cycleTake(self, t: float) -> None:
-        take = next((k for k in self.log.takes if k.start <= t < (k.end or k.start)), None)
-        clip = self.edit.clip_at(t)
-        sentence = take.sentence if take else (clip.sentence if clip else None)
-        if sentence is None:
+    @Slot(int, int)
+    def cycleTake(self, sentence: int, direction: int) -> None:
+        """T / Shift+T: the next (older) or previous take of the sentence, in the side panel's order."""
+        if sentence < 0 or self.log is None:
             self.message.emit("info", "No script sentence here")
             return
-        options = [k for k in self.log.takes if k.sentence == sentence and k.status == COMPLETE]
+        options = take_choices(self.log, sentence)
         if len(options) < 2:
-            self.message.emit("info", "Only one good take for this sentence")
+            self.message.emit("info", "This sentence has only one take")
             return
         current = next((c.take for c in self.edit.clips if c.sentence == sentence), None)
         ids = [k.id for k in options]
-        index = (ids.index(current) + 1) % len(ids) if current in ids else 0
-        chosen = options[index]
-        for k in options:
-            k.preferred = k.id == chosen.id
+        index = (ids.index(current) + direction) % len(ids) if current in ids else 0
+        self.useTake(options[index].id)
+
+    @Slot(int, result=float)
+    def useTake(self, take_id: int) -> float:
+        """Puts this take in its sentence's place; returns where it now starts (recording time)."""
+        take = next((k for k in self.log.takes if k.id == take_id), None) if self.log else None
+        if take is None or take.sentence is None or take.end is None:
+            return -1.0
         self._checkpoint()
-        rules = self.rules()
-        self.edit.replace_take(sentence, chosen.start - rules.handle_before, (chosen.end or chosen.start) + rules.handle_after, chosen.id)
-        self._changed()
-        self.message.emit("info", f"Sentence {sentence + 1}: take {chosen.number}")
+        if use_take(self.edit, self.log, take, self.rules(), self.duration, self.item.boundaries()):
+            self._changed()
+            self.message.emit("info", f"Sentence {take.sentence + 1}: take {take.number}")
+        return min((c.start for c in self.edit.clips if c.take == take.id), default=take.start)
+
+    @Slot(int, result="QVariant")
+    def sentenceChoices(self, sentence: int) -> dict:
+        if self.log is None or sentence < 0:
+            return {}
+        in_use = {c.take for c in self.edit.clips if c.sentence == sentence} if self.edit else set()
+        text = ""
+        if self.script is not None and sentence < len(self.script.sentences):
+            text = self.script.sentences[sentence].text
+        return {
+            "sentence": sentence,
+            "text": text,
+            "takes": [{**self._take_info(take), "inUse": take.id in in_use, "recorded": self._recorded_label(take)}
+                      for take in take_choices(self.log, sentence)],
+        }
+
+    def _take_info(self, take) -> dict:
+        return {
+            "take": take.id, "number": take.number, "status": take.status, "duration": round(take.duration, 1),
+            "score": -1 if take.score is None else round(take.score),
+            "flagged": len(take.flagged),
+            "skipped": sum(1 for f in take.flagged if f.get("drill") == "skipped"),
+            "stale": bool(take.stale), "text": take.text, "reason": take.reason,
+        }
+
+    def _recorded_label(self, take) -> str:
+        """Which recording a take is in and roughly when it was read, e.g. "Pickups 2 · 14:05"."""
+        from datetime import datetime, timedelta
+
+        rows = self._part_rows()
+        part = next((p for p in self.part_list if p.start <= take.start < p.end), None)
+        if part is None:
+            return ""
+        label = next((r["label"] for r in rows if r["index"] == part.index), "")
+        try:
+            finished = datetime.fromisoformat(part.created)
+        except ValueError:
+            return label
+        read = (finished - timedelta(seconds=part.end - take.start)).astimezone()
+        when = read.strftime("%H:%M") if read.date() == datetime.now().astimezone().date() else read.strftime("%b %d, %H:%M")
+        return f"{label} · {when}" if label else when
 
     @Slot(float, int, result=float)
     def nextEdge(self, t: float, direction: int) -> float:
@@ -326,13 +345,40 @@ class EditorController(QObject):
             return next((p for p in ordered if p > t + 0.02), self.duration)
         return next((p for p in reversed(ordered) if p < t - 0.02), 0.0)
 
-    @Slot(float, result=float)
-    def playableFrom(self, t: float) -> float:
-        clip = self.edit.clip_at(t)
-        if clip is not None:
-            return t
-        following = [c.start for c in self.edit.clips if c.start > t]
-        return min(following) if following else -1.0
+    @Slot(result="QVariant")
+    def markPoints(self) -> list[float]:
+        """Where takes and markers start, on the recording's clock; the edit view keeps those it shows."""
+        points = {round(take.start, 3) for take in self.log.takes} if self.log else set()
+        points |= {round(marker.start, 3) for marker in self.log.markers} if self.log else set()
+        return sorted(points)
+
+    @Slot(float)
+    def saveFrame(self, t: float) -> None:
+        """Saves the video frame at this moment as a PNG in the script's out folder (thumbnails, slides)."""
+        part = self.item.part_at(t) if self.item else None
+        if part is None or part.video is None:
+            self.message.emit("error", "There's no video at this moment")
+            return
+        from ..edit.trim import offset_at
+
+        local = t - part.start
+        video_time = local - offset_at(list(part.video_segments), part.video_offset, local)
+        if video_time < 0:
+            self.message.emit("error", "The video hadn't started yet at this moment")
+            return
+        minutes, seconds = divmod(t, 60)
+        path = self.item.out_dir / f"frame-{int(minutes):02d}m{seconds:04.1f}s.png"
+
+        def grab():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run([media.ffmpeg(), "-v", "error", "-y", "-ss", f"{video_time:.3f}", "-i", str(part.video), "-frames:v", "1", str(path)],
+                                    capture_output=True, text=True)
+            if result.returncode == 0 and path.exists():
+                self.message.emit("info", f"Frame saved: out/{path.name}")
+            else:
+                self.message.emit("error", f"Couldn't save the frame: {result.stderr.strip().splitlines()[-1] if result.stderr.strip() else 'ffmpeg failed'}")
+
+        threading.Thread(target=grab, daemon=True).start()
 
     def _clip_row(self, clip) -> dict:
         return {"id": clip.id, "start": clip.start, "end": clip.end, "sentence": -1 if clip.sentence is None else clip.sentence}
@@ -341,21 +387,6 @@ class EditorController(QObject):
     def clipAt(self, t: float):
         clip = self.edit.clip_at(t) if self.edit else None
         return self._clip_row(clip) if clip else None
-
-    @Slot(int, result="QVariant")
-    def nextClip(self, clip_id: int):
-        """The clip that plays after this one, in edit order (script order can jump back in time)."""
-        timeline = self.edit.timeline() if self.edit else []
-        ids = [c.id for c in timeline]
-        if clip_id not in ids:
-            return self._clip_row(timeline[0]) if timeline else None
-        position = ids.index(clip_id) + 1
-        return self._clip_row(timeline[position]) if position < len(timeline) else None
-
-    @Slot(result="QVariant")
-    def firstClip(self):
-        timeline = self.edit.timeline() if self.edit else []
-        return self._clip_row(timeline[0]) if timeline else None
 
     @Slot(float, result=int)
     def sentenceAt(self, t: float) -> int:
@@ -366,83 +397,68 @@ class EditorController(QObject):
         return take.sentence if take else -1
 
     @Slot(str)
-    def render(self, target: str) -> None:
+    def render(self, kind: str) -> None:
+        """Exports with the choices remembered from that kind's Export dialog."""
         if self._rendering or self.edit is None:
             return
-        out = self.item.out_dir
-        out.mkdir(parents=True, exist_ok=True)
-        name = f"{self.item.project.title} · {self.item.title}"
-        sources = self.item.sources()
-        try:
-            if target == "timeline":
-                path = exports.write(out / "timeline.otio", exports.otio(self.log, self.edit, sources, self._video_durations(), name=name))
-                self._on_render_done(str(path), "")
-                return
-            if target == "raw":
-                path = exports.write(out / "raw.otio", exports.otio(self.log, None, sources, self._video_durations(), name=name))
-                exports.write(out / "labels.txt", exports.audacity_labels(self.log))
-                self._on_render_done(str(path), "")
-                return
-            if target == "captions":
-                words = exports.edited_words(self.log, self.edit)
-                exports.write(out / "captions.vtt", exports.webvtt(words))
-                path = exports.write(out / "captions.srt", exports.srt(words))
-                self._on_render_done(str(path), "")
-                return
-            if target == "labels":
-                path = exports.write(out / "labels.txt", exports.audacity_labels(self.log))
-                self._on_render_done(str(path), "")
-                return
-            if target == "sentences":
-                if self.script is None:
-                    raise ValueError("this recording has no script")
-                timing = exports.script_timing(self.script, self.log, self.edit, self.item.id)
-                path = exports.write(out / "sentences.json", json.dumps(timing, indent=1, ensure_ascii=False))
-                self._on_render_done(str(path), "")
-                return
-        except Exception as error:
-            self._on_render_done("", str(error))
+        if kind == "video" and not self.has_video:
+            self.message.emit("error", "This recording has no video; export the audio instead")
             return
-        if target not in RENDER_TARGETS:
+        if kind == "sentences" and self.script is None:
+            self.message.emit("error", "This recording has no script")
             return
-        with_video = target.startswith("video")
-        if with_video and not self.has_video:
-            self.message.emit("error", "This recording has no video; render a narration instead")
-            return
-        config = config_module.load()["edit"]
-        job = RenderJob(
-            edit=self.edit,
-            sources=sources,
-            output=out / RENDER_TARGETS[target],
-            with_video=with_video,
-            encoder="hevc" if target == "video-hevc" else "auto",
-            normalize=bool(config.get("normalize")),
-            loudness=float(config.get("loudness", -16.0)),
-            chapters=exports.chapters(self.log, self.edit),
-            title=name,
-            progress=self._renderProgress.emit,
-        )
         self._rendering = True
         self._render_progress = 0.0
         self.renderChanged.emit()
-        threading.Thread(target=self._render_job, args=(job,), daemon=True).start()
+        edit = Edit.from_dict(self.edit.as_dict())
+        threading.Thread(target=self._export, args=(kind, edit), daemon=True).start()
 
-    def _video_durations(self) -> dict:
-        durations = {}
-        for part in self.part_list:
-            if part.video is not None:
-                try:
-                    durations[part.video] = media.probe(part.video).duration
-                except Exception:
-                    pass
-        return durations
-
-    def _render_job(self, job: RenderJob) -> None:
+    def _export(self, kind: str, edit: Edit) -> None:
         try:
-            path = render_with_fallback(job)
-            self._renderDone.emit(str(path), "")
+            self._renderDone.emit(str(self._write_export(kind, edit)), "")
         except Exception as error:
             self._renderDone.emit("", str(error))
+
+    def _write_export(self, kind: str, edit: Edit) -> Path:
+        return outputs.export(kind, self.item, self.log, edit, config_module.load()["export"], self.script, self._probe, self._renderProgress.emit)
+
+    def _probe(self, path: Path):
+        stamp = (path, path.stat().st_mtime)
+        if stamp not in self._probe_cache:
+            self._probe_cache[stamp] = media.probe(path)
+        return self._probe_cache[stamp]
+
+    @Slot(result="QVariant")
+    def videoShape(self) -> dict:
+        """The first recording's picture, so the Video export dialog never offers to upscale."""
+        if self.item is None:
+            return {}
+        video = next((source.video for source in self.item.sources() if source.video is not None), None)
+        if video is None:
+            return {}
+        try:
+            info = self._probe(video)
+        except Exception:
+            return {}
+        return {"width": info.width, "height": info.height, "fps": round(info.fps, 2)}
+
+    @Slot(str, result=str)
+    def videoEncoder(self, video_format: str) -> str:
+        fmt = render_module.VIDEO_FORMATS.get(video_format)
+        return render_module.video_encoder(fmt.codec) if fmt else ""
+
+    @Slot(str, result=str)
+    def exportName(self, kind: str) -> str:
+        settings = config_module.load()["export"]
+        if kind == "video":
+            return render_module.video_output_name(settings)
+        if kind == "audio":
+            return render_module.audio_output_name(settings)
+        if kind == "captions":
+            return exports.CAPTION_FORMATS.get(settings["captions_format"], "")
+        if kind == "timeline":
+            return exports.TIMELINE_FORMATS.get(settings["timeline_format"], "")
+        return ""
 
     def _on_render_progress(self, fraction: float) -> None:
         self._render_progress = fraction
@@ -491,6 +507,21 @@ class EditorController(QObject):
             position += clip.end - clip.start
         return rows
 
+    def _blocks(self) -> list[dict]:
+        """V on a scripted recording: each take in use shown whole, in the order the edit plays, so
+        what was cut from it shows (greyed) and can be restored. Laid out back to back like segments."""
+        if self.edit is None or self.log is None or self.item is None:
+            return []
+        rows = []
+        position = 0.0
+        for start, end, clips, take in take_blocks(self.edit, self.log, self.rules(), self.duration, self.item.boundaries()):
+            first = clips[0]
+            info = self._take_info(take) if take else {"take": -1, "number": 0, "status": "complete", "score": -1, "flagged": 0, "skipped": 0, "stale": False, "text": first.label, "reason": ""}
+            rows.append({**info, "start": start, "end": end, "editStart": position, "sentence": -1 if first.sentence is None else first.sentence,
+                         "kind": first.kind, "chosen": True})
+            position += end - start
+        return rows
+
     def _takes(self) -> list[dict]:
         if self.log is None:
             return []
@@ -512,12 +543,13 @@ class EditorController(QObject):
     def _markers(self) -> list[dict]:
         if self.log is None:
             return []
-        rows = [{"kind": m.kind, "start": m.start, "end": m.end, "label": m.label} for m in self.log.markers]
+        # A script's chapters come from its sections (the chapters lane), not from the markers logged while recording.
+        rows = [{"kind": m.kind, "start": m.start, "end": m.end, "label": m.label} for m in self.log.markers
+                if not (self.script is not None and m.kind == kinds.CHAPTER)]
         for take in self.log.takes:
             for flagged in take.flagged:
                 when = flagged.get("start") or take.start
                 rows.append({"kind": "flag", "start": when, "end": flagged.get("end") or when, "label": flagged.get("text", "")})
-        rows.extend({"kind": "screen", "start": f["start"], "end": f["end"], "label": "screen changed"} for f in self._screen_flags)
         return rows
 
     def _words(self) -> list[dict]:
@@ -540,7 +572,6 @@ class EditorController(QObject):
 
     loaded = Property(bool, lambda self: self.log is not None, notify=loadedChanged)
     hasScript = Property(bool, lambda self: self.script is not None, notify=loadedChanged)
-    title = Property(str, lambda self: f"{self.item.project.title} · {self.item.title}" if self.item else "", notify=loadedChanged)
     sourceDuration = Property(float, lambda self: self.duration, notify=loadedChanged)
     hasVideo = Property(bool, lambda self: self.has_video, notify=mediaChanged)
     parts = Property("QVariant", _part_rows, notify=mediaChanged)
@@ -549,12 +580,16 @@ class EditorController(QObject):
     clips = Property("QVariant", _clips, notify=editChanged)
     takes = Property("QVariant", _takes, notify=editChanged)
     segments = Property("QVariant", _segments, notify=editChanged)
+    blocks = Property("QVariant", _blocks, notify=editChanged)
+    scriptSections = Property("QVariant", lambda self: {
+        "titles": [s.title for s in self.script.sections], "bySentence": [s.section for s in self.script.sentences],
+    } if self.script is not None else {}, notify=loadedChanged)
     markers = Property("QVariant", _markers, notify=editChanged)
     words = Property("QVariant", _words, notify=loadedChanged)
+    canReset = Property(bool, lambda self: not self._is_automatic(), notify=resetChanged)
     editDuration = Property(float, lambda self: self.edit.duration if self.edit else 0.0, notify=editChanged)
     staleSentences = Property("QVariant", _stale_sentences, notify=editChanged)
     canUndo = Property(bool, lambda self: bool(self.history and self.history.undo_stack), notify=editChanged)
     canRedo = Property(bool, lambda self: bool(self.history and self.history.redo_stack), notify=editChanged)
-    isDirty = Property(bool, lambda self: self._dirty, notify=editChanged)
     rendering = Property(bool, lambda self: self._rendering, notify=renderChanged)
     renderProgress = Property(float, lambda self: self._render_progress, notify=renderChanged)

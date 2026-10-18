@@ -70,14 +70,4 @@ Item {
         }
     }
 
-    Label {
-        visible: !app.hasScript
-        anchors.centerIn: parent
-        text: app.partial || qsTr("Listening…")
-        font.pixelSize: card.fontSize * 0.7
-        wrapMode: Text.Wrap
-        width: parent.width * 0.9
-        horizontalAlignment: Text.AlignHCenter
-        opacity: 0.8
-    }
 }

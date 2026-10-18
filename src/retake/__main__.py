@@ -26,7 +26,7 @@ def _check(args) -> int:
     words = len(script.words)
     print(f"{script.title}: {len(script.sections)} sections, {spoken} sentences, {words} words, about {words / 140:.1f} min at 140 wpm")
     wake = config["voice"].get("wake_word") or pack.wake_word
-    issues = preflight.check(script, guides, pack, wake, config["video"].get("backend", "none"))
+    issues = preflight.check(script, guides, pack, wake)
     for issue in issues:
         print(f"  {issue.severity:7} {issue.message}")
     if args.guides:
@@ -75,21 +75,18 @@ def _models(args) -> int:
 def _doctor(args) -> int:
     from . import config as config_module
     from .engine import models, settings, tts, whisper_engine
-    from .video import gsr, hyprland, phone
+    from .video import phone
 
     config = config_module.load()
     checks = [
         ("espeak-ng", shutil.which("espeak-ng") is not None, "pronunciation guides and reference voice"),
         ("ffmpeg", shutil.which("ffmpeg") is not None, "rendering and exports"),
-        ("gpu-screen-recorder", gsr.available(), "built-in screen recording"),
         ("scrcpy", phone.available(), "Android phone as camera (optional)"),
-        ("hyprland", hyprland.available(), "camera window placement"),
         ("vosk", config_module.has_module("vosk"), "voice following and commands"),
         ("torch", config_module.has_module("torch"), "Silero VAD and pronunciation scoring (optional)"),
         ("faster-whisper", whisper_engine.available(), "Whisper voice following (optional)"),
         ("piper", tts.piper_binary() is not None, "natural reference voice (optional)"),
         ("nvidia-ml-py", config_module.has_module("pynvml"), "NVIDIA resource monitor (optional)"),
-        ("websockets", config_module.has_module("websockets"), "OBS control (optional)"),
         ("evdev", config_module.has_module("evdev"), "foot pedal grab (optional)"),
         ("jeepney", config_module.has_module("jeepney"), "file chooser portal"),
     ]
@@ -123,53 +120,31 @@ def _pick_item(args):
 
 
 def _render(args) -> int:
-    import json
-
     from . import config as config_module
-    from .edit import exports
     from .edit.autoedit import Rules, auto_edit
-    from .edit.edl import Edit
-    from .edit.render import RenderJob, render_with_fallback
+    from .edit.outputs import KINDS, export
 
-    project, item = _pick_item(args)
+    _, item = _pick_item(args)
     log = item.load_takes()
     duration = item.duration
     config = config_module.load()
     rules = Rules.from_config(config["edit"], config["strictness"])
-    if len(item.parts) > 1 and item.kind == "script":
-        rules.order = "script"
-    if args.auto or not item.edit_path.exists():
+    edit = None if args.auto else item.load_edit()
+    if edit is None:
         edit = auto_edit(log, duration, rules, item.boundaries())
-        edit.save(item.edit_path)
-    else:
-        edit = Edit.load(item.edit_path)
-    sources = item.sources()
-    out = item.out_dir
+        item.save_edit(edit)
+    script = item.load_script()
     for target in args.targets.split(","):
-        if target == "timeline":
-            exports.write(out / "timeline.otio", exports.otio(log, edit, sources, name=f"{project.title} · {item.title}"))
-        elif target == "captions":
-            words = exports.edited_words(log, edit)
-            exports.write(out / "captions.vtt", exports.webvtt(words))
-            exports.write(out / "captions.srt", exports.srt(words))
-        elif target == "labels":
-            exports.write(out / "labels.txt", exports.audacity_labels(log))
-        elif target == "sentences":
-            script = item.load_script()
-            if script is None:
-                print("  no script in this item; skipping sentences")
-                continue
-            exports.write(out / "sentences.json", json.dumps(exports.script_timing(script, log, edit, item.id), indent=1, ensure_ascii=False))
-        else:
-            names = {"video": "video.mp4", "video-hevc": "video-hevc.mp4", "narration": "narration.flac", "mp3": "narration.mp3", "opus": "narration.opus", "wav": "narration.wav"}
-            if target.startswith("video") and not item.has_video:
-                print(f"  no video in this item; skipping {target}")
-                continue
-            job = RenderJob(edit, sources, out / names[target], with_video=target.startswith("video"),
-                            normalize=bool(config["edit"].get("normalize")), loudness=float(config["edit"].get("loudness", -16)),
-                            chapters=exports.chapters(log, edit), title=f"{project.title} · {item.title}",
-                            encoder="hevc" if target == "video-hevc" else args.encoder)
-            render_with_fallback(job)
+        if target not in KINDS:
+            print(f"  unknown target {target}; choose from {', '.join(KINDS)}")
+            continue
+        if target == "video" and not item.has_video:
+            print("  no video in this item; skipping video")
+            continue
+        if target == "sentences" and script is None:
+            print("  no script in this item; skipping sentences")
+            continue
+        export(target, item, log, edit, config["export"], script)
         print(f"  {target}: done")
     return 0
 
@@ -207,10 +182,10 @@ def _projects(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    commands = {"ctl", "check", "guide", "models", "doctor", "render", "hyprland", "free", "projects"}
+    commands = {"ctl", "check", "guide", "models", "doctor", "render", "projects"}
     if not argv or argv[0] not in commands:
         parser = argparse.ArgumentParser(prog="retake", description="Solo talking recordings with the retakes handled for you.")
-        parser.add_argument("path", nargs="?", help="a .retake project to open, or a Markdown script to start a project from")
+        parser.add_argument("path", nargs="?", help="a .retake project (or its folder) to open")
         parser.add_argument("--version", action="version", version=f"retake {__version__}")
         args = parser.parse_args(argv)
         from .ui.app import run
@@ -221,15 +196,6 @@ def main(argv: list[str] | None = None) -> int:
         from .control import ctl
 
         return ctl.main(rest)
-    if command == "free":
-        from .ui.app import run
-
-        return run(free=True)
-    if command == "hyprland":
-        from .video import hyprland
-
-        print(hyprland.config_snippet())
-        return 0
     parser = argparse.ArgumentParser(prog=f"retake {command}")
     if command == "check":
         parser.add_argument("script")
@@ -258,8 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("project", help="a .retake file or project folder")
         parser.add_argument("--item", help="which script or recording, by id (see retake projects --items)")
         parser.add_argument("--auto", action="store_true", help="rebuild the edit with Auto edit first")
-        parser.add_argument("--targets", default="narration,timeline,captions,sentences")
-        parser.add_argument("--encoder", default="auto")
+        parser.add_argument("--targets", default="audio,timeline,captions,sentences",
+                            help="video, audio, captions, timeline, sentences, labels, raw; formats are the ones last chosen in the Export dialogs")
         return _render(parser.parse_args(rest))
     return 1
 

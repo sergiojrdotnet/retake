@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from ..script.model import ADLIB, Script, Sentence, Token
+from ..script.model import ADLIB, Script, Sentence
 from .aligner import Alignment, HypToken, align, word_similarity
 from .takes import COMPLETE, REJECTED, Take, TakeLog, WordTiming
 
@@ -32,7 +32,6 @@ class TrackerEvents(Protocol):
     def take_started(self, take: Take) -> None: ...
     def take_completed(self, take: Take) -> None: ...
     def take_rejected(self, take: Take) -> None: ...
-    def cue_reached(self, token: Token, time: float) -> None: ...
     def off_script(self, start: float, end: float, text: str, inside: bool, filler: bool) -> None: ...
 
 
@@ -80,7 +79,6 @@ class ScriptTracker:
         self.paused = False
         self.excluded: list[tuple[float, float]] = []
         self.floor = 0.0
-        self._fired: set[tuple[int, int]] = set()
         self.final_guess: tuple[int, str] | None = None
 
     def _first_sentence(self) -> int:
@@ -256,8 +254,6 @@ class ScriptTracker:
         self.position = -1
         self.alignment = None
         self.events.take_started(self.take)
-        for token in sentence.leading_cues():
-            self._fire(token, -1, begin)
 
     def _check_restart(self, tokens: list[HypToken]) -> bool:
         """The opening said again after the reading got past it. It can start at the second word (the
@@ -366,20 +362,8 @@ class ScriptTracker:
     def _set_position(self, word: int) -> None:
         if word == self.position:
             return
-        previous = self.position
         self.position = word
         self.events.position_changed(self.sentence, word)
-        if word > previous:
-            for position in range(previous + 1, word + 1):
-                for token in self.current.cues_after(position):
-                    self._fire(token, position, self.now)
-
-    def _fire(self, token: Token, position: int, time: float) -> None:
-        key = (self.sentence, id(token))
-        if key in self._fired:
-            return
-        self._fired.add(key)
-        self.events.cue_reached(token, time)
 
     def _timings(self) -> list[WordTiming]:
         if self.alignment is None:

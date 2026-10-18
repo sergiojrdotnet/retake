@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -8,15 +9,73 @@ from typing import Callable
 
 from . import media
 from .edl import Edit
-from .exports import ffmetadata
+from .exports import ass, ffmetadata
 from .trim import offset_at
 
-AUDIO_CODECS = {
-    "flac": ["-c:a", "flac"],
-    "wav": ["-c:a", "pcm_s24le"],
-    "opus": ["-c:a", "libopus", "-b:a", "128k"],
-    "mp3": ["-c:a", "libmp3lame", "-q:a", "2", "-id3v2_version", "3"],
+
+@dataclass(frozen=True)
+class VideoFormat:
+    container: str
+    codec: str
+    audio: str
+
+
+VIDEO_FORMATS = {
+    "mp4-h264": VideoFormat("mp4", "h264", "aac"),
+    "mp4-hevc": VideoFormat("mp4", "hevc", "aac"),
+    "mp4-av1": VideoFormat("mp4", "av1", "aac"),
+    "webm-vp9": VideoFormat("webm", "vp9", "opus"),
+    "mov-prores": VideoFormat("mov", "prores", "pcm"),
 }
+
+# Each codec's GPU encoder (None when NVENC has none) and CPU fallback.
+VIDEO_ENCODERS = {
+    "h264": ("h264_nvenc", "libx264"),
+    "hevc": ("hevc_nvenc", "libx265"),
+    "av1": ("av1_nvenc", "libsvtav1"),
+    "vp9": (None, "libvpx-vp9"),
+    "prores": (None, "prores_ks"),
+}
+
+QUALITIES = ("high", "balanced", "small")
+
+AUDIO_FORMATS = {
+    "flac": "flac",
+    "wav": "wav",
+    "mp3": "mp3",
+    "opus": "opus",
+    "aac": "m4a",
+    "alac": "m4a",
+    "vorbis": "ogg",
+}
+
+
+def video_encoder(codec: str, gpu: bool = True) -> str:
+    accelerated, software = VIDEO_ENCODERS[codec]
+    if gpu and accelerated and media.encoder_works(accelerated):
+        return accelerated
+    return software
+
+
+def video_output_name(settings: dict) -> str:
+    fmt = VIDEO_FORMATS[settings["video_format"]]
+    stem = "video"
+    if fmt.container == "mp4" and fmt.codec != "h264":
+        stem += f"-{fmt.codec}"
+    if int(settings.get("video_size") or 0):
+        stem += f"-{int(settings['video_size'])}p"
+    return f"{stem}.{fmt.container}"
+
+
+def audio_output_name(settings: dict) -> str:
+    codec = settings["audio_format"]
+    return ("narration-alac" if codec == "alac" else "narration") + "." + AUDIO_FORMATS[codec]
+
+
+def scaled(width: int, height: int, short_side: int) -> tuple[int, int]:
+    """The picture's size with its short side at most short_side (never upscaled), in even pixels."""
+    factor = min(1.0, short_side / min(width, height)) if short_side else 1.0
+    return max(2, round(width * factor / 2) * 2), max(2, round(height * factor / 2) * 2)
 
 
 @dataclass
@@ -47,13 +106,47 @@ class RenderJob:
     edit: Edit
     sources: list[Source]
     output: Path
-    with_video: bool = False
-    encoder: str = "auto"
-    normalize: bool = False
-    loudness: float = -16.0
+    video: str = ""
+    quality: str = "high"
+    size: int = 0
+    fps: float = 0.0
+    gpu: bool = True
+    audio: str = "flac"
+    audio_bitrate: str = "192k"
+    sample_rate: int = 0
+    channels: int = 0
+    depth: int = 24
+    loudness: float = 0.0
     chapters: list[tuple[float, str]] = field(default_factory=list)
     title: str = ""
+    captions: list[tuple[float, float, str]] = field(default_factory=list)
+    caption_line: int = 42
+    caption_lines: int = 2
     progress: Callable[[float], None] = lambda fraction: None
+
+    @property
+    def with_video(self) -> bool:
+        return bool(self.video)
+
+
+def video_job(edit: Edit, sources: list[Source], out_dir: Path, settings: dict, **extra) -> RenderJob:
+    """A video export with the choices remembered from the Video export dialog (config [export])."""
+    fmt = VIDEO_FORMATS[settings["video_format"]]
+    return RenderJob(
+        edit, sources, out_dir / video_output_name(settings), video=fmt.codec, audio=fmt.audio,
+        quality=settings["video_quality"], size=int(settings.get("video_size") or 0), fps=float(settings.get("video_fps") or 0),
+        audio_bitrate=settings["video_audio_bitrate"], loudness=float(settings.get("loudness") or 0),
+        caption_line=int(settings["caption_line"]), caption_lines=int(settings["caption_lines"]), **extra,
+    )
+
+
+def audio_job(edit: Edit, sources: list[Source], out_dir: Path, settings: dict, **extra) -> RenderJob:
+    return RenderJob(
+        edit, sources, out_dir / audio_output_name(settings), audio=settings["audio_format"],
+        audio_bitrate=settings["audio_bitrate"], sample_rate=int(settings.get("audio_rate") or 0),
+        channels=int(settings.get("audio_channels") or 0), depth=int(settings.get("audio_depth") or 24),
+        loudness=float(settings.get("loudness") or 0), **extra,
+    )
 
 
 @dataclass
@@ -74,23 +167,10 @@ class VideoInfo:
 BATCH = 40
 
 
-def frame_aligned(segments: list[tuple[float, float]], fps: float) -> list[tuple[float, float]]:
-    # Video cuts land on whole frames, so every clip is sized to end on the output frame grid;
-    # rounding each clip on its own would add up to seconds of drift against the script timing.
-    aligned = []
-    elapsed = placed = 0.0
-    for start, end in segments:
-        elapsed += end - start
-        boundary = round(elapsed * fps) / fps
-        if boundary > placed:
-            aligned.append((start, start + boundary - placed))
-            placed = boundary
-    return aligned
-
-
 def pieces(job: RenderJob, fps: float = 0.0) -> list[Piece]:
-    """The edit's clips in play order, split where they cross from one recording to the next,
-    and sized on the output frame grid when there is video (see frame_aligned)."""
+    """The edit's clips in play order, split where they cross from one recording to the next.
+    With video, each piece ends on the output frame grid: video cuts land on whole frames, and
+    rounding each piece on its own would add up to seconds of drift against the script timing."""
     split: list[tuple[Source, float, float]] = []
     for clip in job.edit.timeline():
         for source in job.sources:
@@ -114,7 +194,7 @@ def pieces(job: RenderJob, fps: float = 0.0) -> list[Piece]:
     return result
 
 
-def build_inputs(job: RenderJob, batch: list[Piece], info: VideoInfo | None = None) -> tuple[list[str], str]:
+def build_inputs(job: RenderJob, batch: list[Piece], info: VideoInfo | None = None, captions: Path | None = None, offset: float = 0.0) -> tuple[list[str], str]:
     fade = max(0.0, job.edit.crossfade_ms / 1000.0)
     fps = info.fps if info else 30.0
     inputs: list[str] = []
@@ -149,26 +229,56 @@ def build_inputs(job: RenderJob, batch: list[Piece], info: VideoInfo | None = No
             labels.append(f"[v{index}][a{index}]")
         else:
             labels.append(f"[a{index}]")
-    parts.append(f"{''.join(labels)}concat=n={len(batch)}:v={1 if job.with_video else 0}:a=1" + ("[vout][aout]" if job.with_video else "[aout]"))
+    concat = f"{''.join(labels)}concat=n={len(batch)}:v={1 if job.with_video else 0}:a=1"
+    if not job.with_video:
+        parts.append(concat + "[aout]")
+    elif captions is None:
+        parts.append(concat + "[vout][aout]")
+    else:
+        # The captions are timed on the whole edit; this batch starts `offset` into it.
+        parts.append(concat + "[vcat][aout]")
+        parts.append(f"[vcat]setpts=PTS+{offset:.6f}/TB,ass=filename={captions},setpts=PTS-STARTPTS[vout]")
     return inputs, ";\n".join(parts)
 
 
-def _video_encoder(choice: str) -> list[str]:
-    available = media.encoders()
-    if choice == "auto":
-        choice = "h264_nvenc" if "h264_nvenc" in available else "libx264"
-    if choice == "hevc":
-        choice = "hevc_nvenc" if "hevc_nvenc" in available else "libx265"
-    if choice == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0"]
+def _quality_args(encoder: str, quality: str) -> list[str]:
+    level = QUALITIES.index(quality) if quality in QUALITIES else 0
+    if encoder == "h264_nvenc":
+        return ["-preset", "p5", "-rc", "vbr", "-cq", str((19, 23, 27)[level]), "-b:v", "0"]
     # hvc1 tagging lets Apple players and most editors open H.265 in MP4.
-    if choice == "hevc_nvenc":
-        return ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "21", "-b:v", "0", "-tag:v", "hvc1"]
-    if choice == "libx265":
-        return ["-c:v", "libx265", "-preset", "medium", "-crf", "20", "-tag:v", "hvc1"]
-    if choice == "h264_vaapi":
-        return ["-vaapi_device", "/dev/dri/renderD128", "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "20"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"]
+    if encoder == "hevc_nvenc":
+        return ["-preset", "p5", "-rc", "vbr", "-cq", str((21, 25, 29)[level]), "-b:v", "0", "-tag:v", "hvc1"]
+    if encoder == "libx265":
+        return ["-preset", "medium", "-crf", str((20, 23, 26)[level]), "-tag:v", "hvc1"]
+    if encoder == "av1_nvenc":
+        return ["-preset", "p5", "-rc", "vbr", "-cq", str((24, 30, 36)[level]), "-b:v", "0"]
+    if encoder == "libsvtav1":
+        return ["-preset", "8", "-crf", str((26, 32, 38)[level])]
+    if encoder == "libvpx-vp9":
+        return ["-crf", str((28, 33, 38)[level]), "-b:v", "0", "-deadline", "good", "-cpu-used", "4", "-row-mt", "1"]
+    if encoder == "prores_ks":
+        return ["-profile:v", str((3, 2, 1)[level]), "-vendor", "apl0"]
+    return ["-preset", "veryfast", "-crf", str((18, 21, 24)[level])]
+
+
+def _video_args(job: RenderJob) -> list[str]:
+    encoder = video_encoder(job.video, job.gpu)
+    pixels = "yuv422p10le" if job.video == "prores" else "yuv420p"
+    return ["-c:v", encoder, *_quality_args(encoder, job.quality), "-pix_fmt", pixels]
+
+
+def _audio_args(job: RenderJob) -> list[str]:
+    deep = job.depth >= 24
+    return {
+        "flac": ["-c:a", "flac", "-sample_fmt", "s32" if deep else "s16", "-bits_per_raw_sample", "24" if deep else "16"],
+        "alac": ["-c:a", "alac", "-sample_fmt", "s32p" if deep else "s16p", "-bits_per_raw_sample", "24" if deep else "16"],
+        "wav": ["-c:a", "pcm_s24le" if deep else "pcm_s16le"],
+        "pcm": ["-c:a", "pcm_s24le" if deep else "pcm_s16le"],
+        "mp3": ["-c:a", "libmp3lame", "-b:a", job.audio_bitrate, "-id3v2_version", "3"],
+        "opus": ["-c:a", "libopus", "-b:a", job.audio_bitrate],
+        "aac": ["-c:a", "aac", "-b:a", job.audio_bitrate],
+        "vorbis": ["-c:a", "libvorbis", "-b:a", job.audio_bitrate],
+    }[job.audio]
 
 
 def _video_info(job: RenderJob) -> VideoInfo | None:
@@ -177,7 +287,11 @@ def _video_info(job: RenderJob) -> VideoInfo | None:
         return None
     probes = {video: media.probe(video) for video in dict.fromkeys(videos)}
     first = probes[videos[0]]
-    return VideoInfo({video: info.duration for video, info in probes.items()}, first.fps or 30.0, first.width or 1920, first.height or 1080)
+    width, height = scaled(first.width or 1920, first.height or 1080, job.size)
+    fps = first.fps or 30.0
+    if job.fps and job.fps < fps:
+        fps = job.fps
+    return VideoInfo({video: info.duration for video, info in probes.items()}, fps, width, height)
 
 
 def render(job: RenderJob) -> Path:
@@ -191,6 +305,10 @@ def render(job: RenderJob) -> Path:
     job.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="retake-render-") as scratch_name:
         scratch = Path(scratch_name)
+        captions = None
+        if info and job.captions:
+            captions = scratch / "captions.ass"
+            captions.write_text(ass(job.captions, info.width, info.height, job.caption_line, job.caption_lines), encoding="utf-8")
         batches = [planned[i:i + BATCH] for i in range(0, len(planned), BATCH)]
         outputs = []
         done = 0.0
@@ -200,9 +318,9 @@ def render(job: RenderJob) -> Path:
             offset = done
 
             def report(fraction: float, offset=offset, batch_total=batch_total) -> None:
-                job.progress(min(0.98, (offset + fraction * batch_total) / max(total, 0.001)))
+                job.progress(min(0.95, (offset + fraction * batch_total) / max(total, 0.001)))
 
-            _render_part(job, batch, part, info, scratch, report)
+            _render_part(job, batch, part, info, scratch, report, captions, offset)
             outputs.append(part)
             done += batch_total
         _finish(job, outputs, total, scratch)
@@ -210,17 +328,25 @@ def render(job: RenderJob) -> Path:
     return job.output
 
 
-def _render_part(job: RenderJob, batch: list[Piece], part: Path, info: VideoInfo | None, scratch: Path, progress) -> None:
-    inputs, graph = build_inputs(job, batch, info)
+def _render_part(job: RenderJob, batch: list[Piece], part: Path, info: VideoInfo | None, scratch: Path, progress,
+                 captions: Path | None = None, offset: float = 0.0) -> None:
+    inputs, graph = build_inputs(job, batch, info, captions, offset)
     graph_file = scratch / f"{part.stem}.txt"
     graph_file.write_text(graph)
     command = [media.ffmpeg(), "-y", "-v", "error", "-progress", "pipe:1", "-nostats", *inputs, "-/filter_complex", str(graph_file)]
     if job.with_video:
-        command += ["-map", "[vout]", "-map", "[aout]"] + _video_encoder(job.encoder) + ["-pix_fmt", "yuv420p", "-c:a", "pcm_s24le"]
+        command += ["-map", "[vout]", "-map", "[aout]", *_video_args(job), "-c:a", "pcm_s24le"]
     else:
         command += ["-map", "[aout]", "-c:a", "pcm_f32le"]
     command.append(str(part))
     _run(command, sum(piece.duration for piece in batch), progress)
+
+
+def _measure_loudness(listing: Path, target: float) -> dict:
+    command = [media.ffmpeg(), "-hide_banner", "-nostats", "-f", "concat", "-safe", "0", "-i", str(listing), "-vn",
+               "-af", f"loudnorm=I={target}:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"]
+    errors = subprocess.run(command, capture_output=True, text=True).stderr
+    return json.loads(errors[errors.rindex("{"):errors.rindex("}") + 1])
 
 
 def _finish(job: RenderJob, parts: list[Path], total: float, scratch: Path) -> None:
@@ -233,13 +359,26 @@ def _finish(job: RenderJob, parts: list[Path], total: float, scratch: Path) -> N
         meta.write_text(ffmetadata(job.chapters, total, job.title))
         command += ["-i", str(meta)]
         metadata_index = 1
-    if job.normalize:
-        command += ["-af", f"loudnorm=I={job.loudness}:TP=-1.5:LRA=11"]
+    if job.loudness:
+        # Two passes: measuring first lets loudnorm apply one steady gain instead of riding the level.
+        measured = _measure_loudness(listing, job.loudness)
+        command += ["-af", (
+            f"loudnorm=I={job.loudness}:TP=-1.5:LRA=11:measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:offset={measured['target_offset']}:linear=true"
+        )]
+    job.progress(0.97)
+    # loudnorm works at 192 kHz, so the rate is always set rather than inherited.
+    rate = job.sample_rate or next((media.probe(s.audio).sample_rate for s in job.sources), 0) or 48000
+    command += ["-ar", str(rate)]
+    if job.channels:
+        command += ["-ac", str(job.channels)]
     if job.with_video:
-        command += ["-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+        command += ["-map", "0:v", "-map", "0:a", "-c:v", "copy"]
     else:
-        fmt = job.output.suffix.lstrip(".").lower()
-        command += ["-map", "0:a"] + AUDIO_CODECS.get(fmt, ["-c:a", "flac"])
+        command += ["-map", "0:a"]
+    command += _audio_args(job)
+    if job.output.suffix.lower() in (".mp4", ".mov", ".m4a"):
+        command += ["-movflags", "+faststart"]
     if metadata_index is not None:
         command += ["-map_metadata", str(metadata_index), "-map_chapters", str(metadata_index)]
     command.append(str(job.output))
@@ -247,16 +386,21 @@ def _finish(job: RenderJob, parts: list[Path], total: float, scratch: Path) -> N
 
 
 def _run(command: list[str], total: float, progress: Callable[[float], None]) -> None:
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for line in process.stdout:
-        if line.startswith("out_time_us=") and total > 0:
-            try:
-                progress(min(1.0, int(line.split("=")[1]) / 1_000_000 / total))
-            except ValueError:
-                pass
-    _, errors = process.communicate()
+    # stderr goes to a file: encoders like SVT-AV1 print a banner whatever the log level, and an
+    # unread pipe would stall FFmpeg once it filled.
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True)
+        for line in process.stdout:
+            if line.startswith("out_time_us=") and total > 0:
+                try:
+                    progress(min(1.0, int(line.split("=")[1]) / 1_000_000 / total))
+                except ValueError:
+                    pass
+        process.wait()
+        errors.seek(0)
+        lines = [line for line in errors.read().splitlines() if line.strip() and not line.startswith(("Svt[", "SvtMalloc["))]
     if process.returncode != 0:
-        raise RuntimeError(errors.strip().splitlines()[-1] if errors.strip() else f"ffmpeg exited with {process.returncode}")
+        raise RuntimeError(lines[-1] if lines else f"ffmpeg exited with {process.returncode}")
     progress(1.0)
 
 
@@ -264,7 +408,7 @@ def render_with_fallback(job: RenderJob) -> Path:
     try:
         return render(job)
     except RuntimeError:
-        if job.with_video and job.encoder in ("auto", "h264_nvenc", "hevc", "hevc_nvenc"):
-            job.encoder = "libx265" if job.encoder.startswith("hevc") else "libx264"
+        if job.with_video and job.gpu and video_encoder(job.video) != VIDEO_ENCODERS[job.video][1]:
+            job.gpu = False
             return render(job)
         raise

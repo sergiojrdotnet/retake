@@ -79,10 +79,13 @@ class Engine:
         self.utterance_start: float | None = None
         self.last_decode = 0.0
         self.decoding = False
-        self.free_prompt = ""
+        # Whisper is prompted with the sentence being read, or with the last words heard for an ad-lib.
+        self.recent_prompt = ""
         self.latency: dict[str, float] = {}
         self.reported_progress = 0.0
         self.listening = False
+        # Between recordings, only voice commands are listened for ("retake, start recording").
+        self.commands_only = False
 
     @staticmethod
     def _connect(address: str, authkey: bytes) -> Connection:
@@ -166,7 +169,6 @@ class Engine:
         self._loaded_name = "vosk"
         self.tracker = VoskTracker(self.settings["tracking_model"])
         return reason
-        return self.settings["tracking_model"].name
 
     def _load_commands(self):
         from ..languages import packs
@@ -247,11 +249,12 @@ class Engine:
             return
         samples = np.frombuffer(payload, dtype=np.int16)
         self.history.append(start_sample, samples)
-        if not self.listening:
+        if not self.listening and not self.commands_only:
             return
         arrived = time.monotonic()
         self.vad_queue.put((start_sample, samples, arrived))
-        self.track_queue.put((start_sample, samples, arrived))
+        if self.listening:
+            self.track_queue.put((start_sample, samples, arrived))
         if self.settings.get("commands"):
             self.command_queue.put((start_sample, samples, arrived))
 
@@ -259,7 +262,9 @@ class Engine:
         kind = message.get("type")
         if kind == "listen":
             self.listening = bool(message.get("active"))
+            self.commands_only = bool(message.get("commands")) and not self.listening
             if not self.listening:
+                self.utterance_start = None
                 for pending in (self.vad_queue, self.track_queue, self.command_queue):
                     while not pending.empty():
                         try:
@@ -337,7 +342,7 @@ class Engine:
                 for speech, at in self.vad.process(start, samples):
                     if speech:
                         self.timeline.speech_started(at)
-                        if self.utterance_start is None:
+                        if self.utterance_start is None and self.listening:
                             self.utterance_start = at
                     else:
                         self.timeline.speech_ended(at)
@@ -415,7 +420,7 @@ class Engine:
             began = time.monotonic()
             window_start = max(0.0, start - 0.2)
             audio = self.history.slice(window_start, end)
-            prompt = self.context_text or self.free_prompt
+            prompt = self.context_text or self.recent_prompt
             words = self.whisper.transcribe(audio, window_start, prompt)
             words = [w for w in words if self.timeline.speech_between(w["start"] - 0.1, w["end"] + 0.1) > 0]
             self.send({"type": "words", "final": final, "replace_from": window_start, "words": words})
@@ -425,7 +430,7 @@ class Engine:
                         self.send(event)
             self.send({"type": "progress", "time": end})
             if final and words:
-                self.free_prompt = " ".join(w["text"] for w in words)[-200:]
+                self.recent_prompt = " ".join(w["text"] for w in words)[-200:]
             self.latency["tracking"] = time.monotonic() - began
         finally:
             self.decoding = False

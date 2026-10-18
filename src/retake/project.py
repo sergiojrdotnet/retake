@@ -1,22 +1,18 @@
 from __future__ import annotations
 
 import difflib
-import json
 import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .script.lexicon import atomic_write
 from .edit.trim import Segment
 from .session.takes import REJECTED, Marker, Take, TakeLog, WordTiming
+from .store import Store
 
-FORMAT = "retake-project"
-VERSION = 2
 EXTENSION = ".retake"
-SCRIPT = "script"
-FREE = "free"
+VIDEO_SUFFIXES = (".mkv", ".mp4", ".mov", ".webm")
 
 
 @dataclass
@@ -63,9 +59,8 @@ def relative(directory: Path, path: Path) -> str:
 def _resolve(directory: Path, file: str | None) -> Path | None:
     if not file:
         return None
-    path = Path(file)
-    candidates = [directory / path] if not path.is_absolute() else [path, directory / "video" / path.name]
-    return next((candidate for candidate in candidates if candidate.exists()), None)
+    path = directory / file
+    return path if path.exists() else None
 
 
 def audio_duration(path: Path) -> float:
@@ -90,7 +85,8 @@ def _now() -> str:
 
 
 class Item:
-    """A script, or a free recording, inside a project, with its own folder of media."""
+    """A script inside a project. Its media (audio and video per part, and the exports) sit in its
+    own folder; everything else is in the project's .retake file."""
 
     def __init__(self, project: Project, data: dict):
         self.project = project
@@ -99,10 +95,6 @@ class Item:
     @property
     def id(self) -> str:
         return self.data["id"]
-
-    @property
-    def kind(self) -> str:
-        return self.data.get("kind", SCRIPT)
 
     @property
     def title(self) -> str:
@@ -118,21 +110,9 @@ class Item:
         return self.project.directory / name if name else None
 
     @property
-    def snapshot_file(self) -> Path:
-        return self.folder / "script.md"
-
-    @property
     def source(self) -> Path | None:
         source = self.data.get("source")
         return Path(source) if source else None
-
-    @property
-    def takes_path(self) -> Path:
-        return self.folder / "takes.json"
-
-    @property
-    def edit_path(self) -> Path:
-        return self.folder / "edit.json"
 
     @property
     def out_dir(self) -> Path:
@@ -208,51 +188,122 @@ class Item:
     def load_script(self):
         """The script the takes refer to: the snapshot taken at the last recording, else the project copy."""
         from .languages import packs
-        from .script.parser import parse_file
+        from .script.lexicon import Lexicon
+        from .script.parser import parse
 
-        for candidate in (self.snapshot_file, self.script_file):
-            if candidate is not None and candidate.exists():
-                try:
-                    return parse_file(candidate, packs.get(self.project.language))
-                except (OSError, KeyError, ValueError):
-                    return None
-        return None
+        if self.script_file is None:
+            return None
+        text = self.snapshot
+        try:
+            if text is None:
+                text = self.script_file.read_text(encoding="utf-8")
+            return parse(text, packs.get(self.project.language), path=self.script_file, spoken=Lexicon.for_script(self.script_file).spoken_forms())
+        except (OSError, KeyError, ValueError):
+            return None
 
-    def recording_files(self) -> list[Path]:
-        """Everything recorded for this item: parts, takes, the edit, the snapshot, video and exports.
-        The script itself, in the project's scripts folder, isn't among them."""
-        folder = self.folder
-        names = [p for p in folder.glob("part-*") if p.is_file()]
-        names += [folder / n for n in ("takes.json", "edit.json", "script.md", "video", "out")]
-        return [p for p in names if p.exists()]
+    @property
+    def snapshot(self) -> str | None:
+        return self.project.store.snapshot(self.id)
 
-    def forget_recordings(self) -> None:
-        self.data["parts"] = []
-        self.project.save()
+    def save_snapshot(self, text: str) -> None:
+        self.project.store.save_snapshot(self.id, text)
+
+    def load_edit(self):
+        from .edit.edl import Edit
+
+        data = self.project.store.edit(self.id)
+        return Edit.from_dict(data) if data else None
+
+    def save_edit(self, edit) -> None:
+        self.project.store.save_edit(self.id, edit.as_dict())
 
     def load_takes(self) -> TakeLog:
-        if self.takes_path.exists():
-            log = TakeLog.load(self.takes_path)
-            log.path = self.takes_path
-            return log
-        return TakeLog(self.takes_path)
+        store, item_id = self.project.store, self.id
+        return TakeLog.from_dict(store.log(item_id) or {}, sink=lambda data: store.save_log(item_id, data))
+
+    def recording_log(self, part: int) -> TakeLog:
+        """The take log of the part being recorded, kept in the .retake file as it goes so a crash
+        loses nothing; the takes join the item's once the part is finished."""
+        store, item_id = self.project.store, self.id
+        return TakeLog(sink=lambda data: store.save_recording(item_id, part, data))
+
+    def unfinished_recording(self, part: int) -> TakeLog | None:
+        data = self.project.store.recording(self.id, part)
+        return TakeLog.from_dict(data) if data else None
+
+    def finish_recording(self, part_log: TakeLog, index: int, audio: Path, duration: float, **part) -> list[Take]:
+        """Moves a finished part's takes onto the item's timeline and adds the part, in one write."""
+        with self.project.store.batch():
+            added = merge_takes(self.load_takes(), part_log, self.duration)
+            self.add_part(index, audio, duration, **part)
+            self.project.store.drop_recording(self.id, index)
+        return added
+
+    def recording_files(self) -> list[Path]:
+        """The media recorded for this item (every part's audio and video) and its exports. The
+        script itself, in the project's scripts folder, isn't among them."""
+        folder = self.folder
+        files = [p for p in folder.glob("part-*") if p.is_file()]
+        files += [p for p in folder.glob(".part-*") if p.is_file()]
+        return files + [folder / "out"] if (folder / "out").exists() else files
+
+    def forget_recordings(self) -> None:
+        with self.project.store.batch():
+            self.data["parts"] = []
+            self.project.store.forget(self.id)
+            self.project.save()
+
+    def remove_part(self, index: int) -> list[Path]:
+        """Takes one recording out. Its takes, markers and edit clips go; whatever came after slides back
+        to close the gap on the timeline, hand edits included. Returns the files that belonged to it."""
+        part = next((p for p in self.parts if p.index == index), None)
+        if part is None:
+            return []
+        start, end, gap = part.start, part.end, part.duration
+
+        def inside(t: float) -> bool:
+            return start - 1e-6 <= t < end - 1e-6
+
+        def moved(t: float) -> float:
+            return t - gap if t >= end - 1e-6 else t
+
+        log = self.load_takes()
+        log.takes = [t for t in log.takes if not inside(t.start)]
+        for take in log.takes:
+            take.start = moved(take.start)
+            take.end = None if take.end is None else moved(take.end)
+            for word in take.words:
+                word.start, word.end = moved(word.start), moved(word.end)
+            take.flagged = [{**f, **{k: moved(f[k]) for k in ("start", "end") if isinstance(f.get(k), (int, float))}} for f in take.flagged]
+        log.markers = [m for m in log.markers if not inside(m.start)]
+        for marker in log.markers:
+            marker.start, marker.end = moved(marker.start), moved(marker.end)
+        edit = self.load_edit()
+        with self.project.store.batch():
+            log.save()
+            if edit is not None:
+                edit.clips = [c for c in edit.clips if not inside(c.start)]
+                for clip in edit.clips:
+                    clip.start, clip.end = moved(clip.start), moved(clip.end)
+                edit.source_duration = max(0.0, edit.source_duration - gap)
+                self.save_edit(edit)
+            self.data["parts"] = [e for e in self.data.get("parts", []) if int(e.get("index", 0)) != index]
+            self.project.save()
+        stem = f"part-{index:03d}"
+        return sorted(f for pattern in (f"{stem}.*", f".{stem}.*") for f in self.folder.glob(pattern) if f.is_file())
 
     def status(self, script=None) -> dict:
         """Sentences with a good take, out of the script's trackable sentences."""
-        recorded = set()
-        if self.takes_path.exists():
-            try:
-                data = json.loads(self.takes_path.read_text(encoding="utf-8"))
-                recorded = {t["sentence"] for t in data.get("takes", []) if t.get("status") == "complete" and t.get("sentence") is not None}
-            except (OSError, json.JSONDecodeError):
-                pass
+        data = self.project.store.log(self.id) or {}
+        recorded = {t["sentence"] for t in data.get("takes", []) if t.get("status") == "complete" and t.get("sentence") is not None}
         total = sum(1 for s in script.sentences if s.trackable) if script is not None else 0
         return {"recorded": len(recorded), "total": total, "duration": self.duration, "parts": len(self.data.get("parts", []))}
 
 
 class Project:
-    def __init__(self, path: Path, data: dict):
+    def __init__(self, path: Path, store: Store, data: dict):
         self.path = path
+        self.store = store
         self.data = data
 
     @property
@@ -274,21 +325,14 @@ class Project:
     def item(self, item_id: str) -> Item | None:
         return next((item for item in self.items if item.id == item_id), None)
 
-    @property
-    def scripts(self) -> list[Item]:
-        return [item for item in self.items if item.kind == SCRIPT]
-
     # Creating, loading and saving
 
     @classmethod
     def create(cls, directory: Path, title: str, language: str = "en", native: str = "") -> Project:
         directory.mkdir(parents=True, exist_ok=True)
-        data = {
-            "format": FORMAT, "version": VERSION, "title": title, "created": _now(), "modified": _now(),
-            "language": language, "native": native,
-            "items": [],
-        }
-        project = cls(directory / f"{file_name(title)}{EXTENSION}", data)
+        path = directory / f"{file_name(title)}{EXTENSION}"
+        data = {"title": title, "created": _now(), "modified": _now(), "language": language, "native": native, "items": []}
+        project = cls(path, Store(path, create=True), data)
         project.save()
         return project
 
@@ -301,15 +345,15 @@ class Project:
             if not found:
                 raise ValueError(f"No Retake project in {path}")
             path = found[0]
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("format") != FORMAT:
-            raise ValueError(f"{path.name} is not a Retake project")
-        data.setdefault("items", [])
-        return cls(path, data)
+        store = Store(path)
+        return cls(path, store, {**store.project(), "items": store.items()})
 
     def save(self) -> None:
         self.data["modified"] = _now()
-        atomic_write(self.path, json.dumps(self.data, indent=1, ensure_ascii=False))
+        self.store.save_project({k: v for k, v in self.data.items() if k != "items"}, self.data.get("items", []))
+
+    def close(self) -> None:
+        self.store.close()
 
     # Items
 
@@ -332,26 +376,19 @@ class Project:
         lexicon = source.with_name(source.stem + ".lexicon.tsv")
         if lexicon.exists():
             shutil.copy2(lexicon, target.with_name(target.stem + ".lexicon.tsv"))
-        entry = {"id": item_id, "kind": SCRIPT, "title": title or source.stem, "folder": item_id,
+        entry = {"id": item_id, "title": title or source.stem, "folder": item_id,
                  "script": relative(self.directory, target), "source": str(source), "added": _now(), "parts": []}
         self.data.setdefault("items", []).append(entry)
         (self.directory / item_id).mkdir(parents=True, exist_ok=True)
         self.save()
         return Item(self, entry)
 
-    def add_free(self) -> Item:
-        stamp = datetime.now()
-        item_id = self._unique_id("free-" + stamp.strftime("%Y-%m-%d_%H%M%S"))
-        entry = {"id": item_id, "kind": FREE, "title": stamp.strftime("%b %d %H:%M"), "folder": item_id, "added": _now(), "parts": []}
-        self.data.setdefault("items", []).append(entry)
-        (self.directory / item_id).mkdir(parents=True, exist_ok=True)
-        self.save()
-        return Item(self, entry)
-
     def remove_item(self, item_id: str) -> None:
-        """Takes an item off the project; its folder stays on disk."""
-        self.data["items"] = [entry for entry in self.data.get("items", []) if entry["id"] != item_id]
-        self.save()
+        """Takes an item, and its takes and edit, off the project; its folder of media stays on disk."""
+        with self.store.batch():
+            self.data["items"] = [entry for entry in self.data.get("items", []) if entry["id"] != item_id]
+            self.store.forget(item_id)
+            self.save()
 
     def rename_item(self, item_id: str, title: str) -> None:
         item = self.item(item_id)
@@ -372,7 +409,7 @@ class Project:
 
     def find_by_source(self, source: Path) -> Item | None:
         wanted = source.expanduser().resolve()
-        return next((item for item in self.scripts if item.source and item.source.expanduser().resolve() == wanted), None)
+        return next((item for item in self.items if item.source and item.source.expanduser().resolve() == wanted), None)
 
 
 # Moving recordings onto an item's timeline
@@ -391,7 +428,7 @@ def merge_takes(item_log: TakeLog, part_log: TakeLog, offset: float) -> list[Tak
             words=[WordTiming(w.word, w.text, w.start + offset, w.end + offset, w.score, w.heard) for w in take.words],
             score=take.score,
             flagged=[{**f, **{k: f[k] + offset for k in ("start", "end") if isinstance(f.get(k), (int, float))}} for f in take.flagged],
-            deviations=take.deviations, preferred=take.preferred,
+            deviations=take.deviations,
         )
         item_log.takes.append(moved)
         added.append(moved)
@@ -478,44 +515,43 @@ def remap_item(item: Item, old_script, new_script) -> Remap:
             take.stale = True
             if take.status == "complete":
                 reworded.add(take.sentence)
-    log.save()
-    if item.edit_path.exists():
-        from .edit.edl import Edit
-
-        edit = Edit.load(item.edit_path)
-        kept = []
-        for clip in edit.clips:
-            if clip.sentence is None:
-                kept.append(clip)
-            elif mapping.get(clip.sentence) is not None:
-                clip.sentence = mapping[clip.sentence][0]
-                kept.append(clip)
-        edit.clips = kept
-        edit.save(item.edit_path)
+    edit = item.load_edit()
+    with item.project.store.batch():
+        log.save()
+        if edit is not None:
+            kept = []
+            for clip in edit.clips:
+                if clip.sentence is None:
+                    kept.append(clip)
+                elif mapping.get(clip.sentence) is not None:
+                    clip.sentence = mapping[clip.sentence][0]
+                    kept.append(clip)
+            edit.clips = kept
+            item.save_edit(edit)
     return Remap(sorted(reworded), lost)
 
 
 def sync_script(item: Item) -> Remap | None:
     """Brings an item's snapshot up to date with its script, re-pointing takes when the text changed."""
-    if item.kind != SCRIPT or item.script_file is None or not item.script_file.exists():
+    if item.script_file is None or not item.script_file.exists():
         return None
     current = item.script_file.read_text(encoding="utf-8")
-    snapshot = item.snapshot_file
+    snapshot = item.snapshot
     result = None
-    if snapshot.exists() and item.parts and snapshot.read_text(encoding="utf-8") != current:
+    if snapshot is not None and item.parts and snapshot != current:
         from .languages import packs
-        from .script.parser import parse_file
+        from .script.parser import parse
 
         pack = packs.get(item.project.language)
-        result = remap_item(item, parse_file(snapshot, pack), parse_file(item.script_file, pack))
-    if result is not None or not snapshot.exists():
-        item.folder.mkdir(parents=True, exist_ok=True)
-        snapshot.write_text(current, encoding="utf-8")
+        result = remap_item(item, parse(snapshot, pack, path=item.script_file), parse(current, pack, path=item.script_file))
+    if result is not None or snapshot is None:
+        item.save_snapshot(current)
     return result
 
 
 def recover_parts(item: Item) -> list[int]:
-    """Adds parts left behind by a crash: audio on disk with no entry in the project file."""
+    """Adds parts left behind by a crash: audio on disk with no part in the project, and the takes
+    recorded with it."""
     known = {int(entry.get("index", 0)) for entry in item.data.get("parts", [])}
     recovered = []
     for audio in sorted(item.folder.glob("part-*.flac")):
@@ -526,13 +562,8 @@ def recover_parts(item: Item) -> list[int]:
         duration = audio_duration(audio)
         if duration <= 0:
             continue
-        offset = item.duration
-        pending = item.folder / f"part-{index:03d}.takes.json"
-        if pending.exists():
-            merge_takes(item.load_takes(), TakeLog.load(pending), offset)
-            pending.unlink(missing_ok=True)
-        video = next(iter(sorted((item.folder / "video").glob(f"part-{index:03d}.*"))), None)
-        item.add_part(index, audio, duration, kind="recovered", video=video)
+        video = next((f for f in sorted(item.folder.glob(f"part-{index:03d}.*")) if f.suffix in VIDEO_SUFFIXES), None)
+        item.finish_recording(item.unfinished_recording(index) or TakeLog(), index, audio, duration, kind="recovered", video=video)
         recovered.append(index)
     return recovered
 
@@ -557,9 +588,12 @@ def known_projects(base: Path, recent: list[str] | None = None) -> list[Project]
     for candidate in candidates:
         try:
             project = Project.load(candidate)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (OSError, ValueError):
             continue
-        found.setdefault(project.path.resolve(), project)
+        if project.path.resolve() in found:
+            project.close()
+            continue
+        found[project.path.resolve()] = project
     return list(found.values())
 
 
@@ -573,10 +607,11 @@ def list_projects(base: Path, recent: list[str] | None = None) -> list[dict]:
             "directory": str(project.directory),
             "title": project.title,
             "modified": project.data.get("modified") or "",
-            "scripts": sum(1 for i in items if i.kind == SCRIPT),
+            "scripts": len(items),
             "recordings": sum(len(i.data.get("parts", [])) for i in items),
             "duration": sum(float(p.get("duration") or 0) for i in items for p in i.data.get("parts", [])),
         })
+        project.close()
     rows.sort(key=lambda row: row["modified"] or "", reverse=True)
     return rows
 

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 from ..languages.packs import LanguagePack
 from ..phonetics.guides import GuideBook
-from ..script.model import CAMERA, SCENE, Script
+from ..script.model import Script
 
 ERROR = "error"
 WARNING = "warning"
@@ -28,8 +28,6 @@ def check(
     guides: GuideBook,
     pack: LanguagePack,
     wake_word: str,
-    video_backend: str,
-    obs_scenes: list[str] | None = None,
     missing_models: list[str] | None = None,
     engine_errors: dict[str, str] | None = None,
 ) -> list[Issue]:
@@ -58,18 +56,5 @@ def check(
             if any(w.key == wake for w in sentence.words):
                 issues.append(Issue(WARNING, "wake-word", f"The wake word “{wake_word}” appears in the script; voice commands may trigger while reading", wake, sentence.index))
                 break
-    scenes = set(obs_scenes or [])
-    for sentence in script.sentences:
-        for token in sentence.tokens:
-            if token.kind == SCENE:
-                if video_backend != "obs":
-                    issues.append(Issue(INFO, "cue", f"(SCENE: {token.value}) needs the OBS backend; it will be ignored", sentence=sentence.index))
-                elif obs_scenes is not None and token.value not in scenes:
-                    issues.append(Issue(WARNING, "cue", f"OBS has no scene named “{token.value}”", sentence=sentence.index))
-            elif token.kind == CAMERA:
-                if token.value not in ("full", "corner", "small", "off"):
-                    issues.append(Issue(WARNING, "cue", f"(CAMERA: {token.value}) is not a layout (use full, corner or off)", sentence=sentence.index))
-                elif video_backend not in ("builtin",):
-                    issues.append(Issue(INFO, "cue", f"(CAMERA: {token.value}) only applies to screen recording with the built-in recorder", sentence=sentence.index))
     order = {ERROR: 0, WARNING: 1, INFO: 2}
     return sorted(issues, key=lambda issue: (order[issue.severity], issue.sentence))

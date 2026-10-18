@@ -3,18 +3,18 @@ from __future__ import annotations
 import os
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import Property, QCoreApplication, QObject, QSocketNotifier, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtMultimedia import QVideoSink
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtMultimedia import QMediaDevices, QVideoFrameFormat, QVideoSink
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .. import config as config_module
 from .. import paths
 from .. import project as projects
-from ..control import ctl as ctl_module
 from ..engine import models as model_registry
 from ..engine import settings as engine_settings
 from ..languages import packs
@@ -28,11 +28,9 @@ from ..script.model import ADLIB, WORD, Script
 from ..session import preflight
 from ..session import takes as kinds
 from ..session.coach import CoachSettings, PracticeHistory
-from ..session.session import FREE, SCRIPTED, Session, SessionSettings
+from ..session.session import Session, SessionSettings
 from ..session.takes import COMPLETE, TakeLog
-from ..video import gsr, hyprland
 from ..video import phone as phone_video
-from ..video.obs import ObsClient, ObsError
 from . import modeljobs, portal
 from .sounds import SoundCues, cue_for_notice, cue_for_state
 from .editor import EditorController
@@ -48,7 +46,6 @@ LAYOUTS = {
 }
 LAYOUT_ORDER = list(LAYOUTS)
 DISPLAY_MODES = ["scroll", "step", "card", "page"]
-CAMERA_TITLE = "Retake camera"
 
 
 class Controller(QObject):
@@ -65,11 +62,9 @@ class Controller(QObject):
     coachChanged = Signal()
     drillChanged = Signal()
     uncoachedChanged = Signal()
-    transcriptChanged = Signal()
     devicesChanged = Signal()
     preflightChanged = Signal()
     recentChanged = Signal()
-    cameraChanged = Signal()
     notice = Signal(str, str)
     cameraRecord = Signal(str)
     cameraStop = Signal()
@@ -95,7 +90,6 @@ class Controller(QObject):
     _synced = Signal()
     _portalResult = Signal(str, "QVariant")
     _downloadProgress = Signal(str, float, str)
-    _obsScenes = Signal("QVariant")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -107,7 +101,6 @@ class Controller(QObject):
         self.cues = SoundCues(self.config, self)
         self._recording = False
         self._rehearsal = False
-        self._mode = SCRIPTED
         self._time = 0.0
         self._level = {"peak": [-90.0], "rms": [-90.0], "clip": False}
         self._engines: dict = {}
@@ -115,15 +108,11 @@ class Controller(QObject):
         self._current_sentence = 0
         self._current_word = -1
         self._coach: dict = {}
-        self._transcript_partial = ""
         self._preflight: list[dict] = []
         self._sources: list[dict] = []
-        self._monitors: list[dict] = []
-        self._obs_scene_list: list[str] = []
-        self._camera_layout = self.config["video"].get("camera_layout", "corner")
         self._review: dict = {}
         self._engine_metrics: dict = {}
-        self._layout = self._layout_named(self.config["general"].get("layout_scripted"))
+        self._layout = self._layout_named(self.config["general"].get("layout"))
         self._panels = dict(LAYOUTS[self._layout])
         self._display_mode = self.config["prompter"].get("mode", "scroll")
         self.script: Script | None = None
@@ -148,7 +137,6 @@ class Controller(QObject):
         self._open_timer = QTimer(self, singleShot=True, interval=250)
         self._open_timer.timeout.connect(self._run_pending_open)
         self._synced.connect(self._run_pending_open)
-        self.transcript = DictListModel(["id", "text", "status", "start"], self)
         self.editor = EditorController(self)
         self.session: Session | None = None
         self.log: TakeLog | None = None
@@ -161,25 +149,26 @@ class Controller(QObject):
         self._explorer_visible = bool(self.config["general"].get("explorer", True))
         self._script_meta: dict[str, tuple[float, str, int]] = {}
         self.explorer = DictListModel(["kind", "depth", "id", "part", "title", "detail", "expanded", "expandable", "current"], self)
-        self.screen: gsr.ScreenRecorder | None = None
         self.phone: phone_video.PhoneRecorder | None = None
         self.phone_preview: phone_video.PhoneRecorder | None = None
         self.phone_frames = PhonePreview(self)
         self._known_phones: dict[str, dict] = self._load_known_phones()
         self._settings_cache: dict | None = None
         self.settingsChanged.connect(self._forget_settings)
+        # Changing the edit rules can make the automatic cut differ from the current one.
+        self.settingsChanged.connect(self.editor.resetChanged)
         self._active_serial = ""
         self._detecting = False
         self.phone_frames.activeChanged.connect(self.phonePreviewChanged)
         self._phone_lock = threading.Lock()
-        self.obs: ObsClient | None = None
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.videoInputsChanged.connect(self.devicesChanged)
         self.resource_log: ResourceLog | None = None
         self.camera_file: Path | None = None
         self.camera_started: float | None = None
         self.camera_finished = False
         self.audio_t0: float | None = None
         self._recorder_stopped: dict | None = None
-        self._last_chapter_count = 0
         self._last_tick = 0.0
         self._closing = False
         self._engine_crashes: list[float] = []
@@ -195,13 +184,11 @@ class Controller(QObject):
         self._phoneCamerasFound.connect(self._set_phone_cameras)
         self._portalResult.connect(self._on_portal)
         self._downloadProgress.connect(self._on_download_progress)
-        self._obsScenes.connect(self._set_obs_scenes)
         self._start_processes()
         self._start_control_server()
         self._resource_timer = QTimer(self, interval=1000, timeout=self._sample_resources)
         self._resource_timer.start()
         self._refresh_models()
-        self._refresh_monitors()
         self.processes.send_recorder({"type": "sources"})
         self.pedal = None
         self._start_pedal()
@@ -228,6 +215,13 @@ class Controller(QObject):
         self.engine_notifier = QSocketNotifier(self.engine_conn.fileno(), QSocketNotifier.Read, self)
         self.engine_notifier.activated.connect(self._read_engine)
         self._engine_settings = settings
+        self._update_listening()
+
+    def _update_listening(self) -> None:
+        """Everything is listened to while recording; between recordings on the Record page, only voice
+        commands, so "retake, start recording" works."""
+        idle = self._page == "session" and not self._recording and not self._starting_video and not self._finishing
+        self.processes.send_engine({"type": "listen", "active": self._recording, "commands": idle})
 
     def _start_control_server(self) -> None:
         self.control_server = QLocalServer(self)
@@ -353,8 +347,7 @@ class Controller(QObject):
         self._start_engine()
         if self.session is not None:
             self.session.tracking_active = True
-        if self._recording:
-            self.processes.send_engine({"type": "listen", "active": True})
+        self._update_listening()
 
     def _on_engine(self, message: dict) -> None:
         kind = message.get("type")
@@ -368,10 +361,13 @@ class Controller(QObject):
             self._play_tts(message)
         elif kind == "gap":
             self.notice.emit("error", f"Voice following fell {message['to'] - message['from']:.0f}s behind and skipped ahead; the CPU is busy (see Resources)")
+        elif kind == "command" and not self._recording:
+            action = message.get("action")
+            if action in ("record", "rehearse") and self._page == "session" and not self._starting_video and not self._finishing:
+                self.notice_from_session("command", action)
+                QTimer.singleShot(0, self.record if action == "record" else self.rehearse)
         elif self.session is not None and kind in ("vad", "words", "command", "score", "progress"):
             self.session.on_engine(message)
-            if kind == "words" and self._mode == FREE:
-                self.transcriptChanged.emit()
 
     def _play_tts(self, message: dict) -> None:
         if message.get("error"):
@@ -398,13 +394,6 @@ class Controller(QObject):
         previous, self._state = self._state, state
         self.cues.play(cue_for_state(previous, state))
         self.stateChanged.emit()
-        if self.screen is not None:
-            self.screen.set_paused(state == "paused")
-        if self.obs is not None and self._recording:
-            try:
-                self.obs.pause(state == "paused")
-            except ObsError:
-                pass
 
     def position_changed(self, sentence: int, word: int) -> None:
         self._current_sentence = sentence
@@ -431,17 +420,6 @@ class Controller(QObject):
                 "text": take.text,
             })
         self.takes.set_items(rows)
-        if self._mode == FREE:
-            self.transcript.set_items([{"id": t.id, "text": t.text, "status": t.status, "start": t.start} for t in self.log.takes if t.text])
-        chapters = self.log.markers_of(kinds.CHAPTER, kinds.MARK)
-        if self.obs is not None and len(chapters) > self._last_chapter_count:
-            for marker in chapters[self._last_chapter_count:]:
-                threading.Thread(target=self.obs.chapter, args=(marker.label,), daemon=True).start()
-        self._last_chapter_count = len(chapters)
-
-    def transcript_changed(self, partial: str) -> None:
-        self._transcript_partial = partial
-        self.transcriptChanged.emit()
 
     def coach_feedback(self, take, flagged: list[dict], deviations: list[dict]) -> None:
         enriched = []
@@ -495,20 +473,6 @@ class Controller(QObject):
 
     def request(self, message: dict) -> None:
         self.processes.send_engine(message)
-
-    def camera(self, layout: str) -> None:
-        self._camera_layout = layout
-        self.cameraChanged.emit()
-
-    def scene(self, name: str) -> None:
-        if self.obs is not None:
-            threading.Thread(target=self._obs_scene, args=(name,), daemon=True).start()
-
-    def _obs_scene(self, name: str) -> None:
-        try:
-            self.obs.set_scene(name)
-        except ObsError as error:
-            self.notice.emit("error", str(error))
 
     def review_changed(self, queue: list[int], index: int) -> None:
         self._review = {"queue": queue, "index": index} if queue else {}
@@ -583,10 +547,6 @@ class Controller(QObject):
             self._portalResult.emit(purpose, None)
 
     @Slot()
-    def openScriptDialog(self) -> None:
-        self._choose("quick", "Quick project from a script", [("Scripts", ["*.md", "*.markdown", "*.txt", "*.fountain"])])
-
-    @Slot()
     def openProjectDialog(self) -> None:
         self._choose("project", "Open project", [("Retake projects", ["*.retake"])])
 
@@ -595,18 +555,16 @@ class Controller(QObject):
         if self.project is None:
             self.notice.emit("error", "Open or create a project first")
             return
-        self._choose("import", "Import scripts", [("Scripts", ["*.md", "*.markdown", "*.txt", "*.fountain"])], multiple=True)
+        self._choose("import", "Import scripts", [("Scripts", ["*.md", "*.markdown", "*.txt"])], multiple=True)
 
     def _on_portal(self, purpose: str, result) -> None:
         if result is None:
-            self.notice.emit("error", "The file chooser portal is unavailable; pass the file on the command line: retake path/to/file")
+            self.notice.emit("error", "The file chooser portal is unavailable; pass the project on the command line: retake path/to/project.retake")
             return
         if not result:
             return
         if purpose == "location":
             self.projectLocationChosen.emit(result[0])
-        elif purpose == "quick":
-            self.openScript(result[0])
         elif purpose == "import":
             self.importScripts(list(result))
         else:
@@ -638,9 +596,9 @@ class Controller(QObject):
             self._portalResult.emit("location", None)
 
     @Slot(str, str)
-    def newProject(self, title: str, location: str = "") -> None:
+    def newProject(self, title: str, location: str) -> None:
         title = title.strip()
-        if not title:
+        if not title or self._busy_recording():
             return
         base = Path(location).expanduser() if location else self._projects_dir()
         project = Project.create(projects.new_directory(base, title), title,
@@ -648,26 +606,6 @@ class Controller(QObject):
         self._open_project(project)
         self._set_page("project")
         self.notice.emit("info", f"Created {project.title}. Import its scripts with + in the explorer.")
-
-    @Slot(str)
-    def openScript(self, path: str) -> None:
-        """Quick project: opens the project that already holds this script, or creates one for it."""
-        file = self._local(path)
-        if not file.exists():
-            self.notice.emit("error", f"Script not found: {file}")
-            return
-        found = projects.items_for_source(self._projects_dir(), file, self.config["general"].get("recent_projects", []))
-        if found:
-            project, item = max(found, key=lambda pair: pair[0].data.get("modified") or "")
-            self._open_project(project)
-            self.openItem(item.id, "prompter")
-            return
-        title = self._script_title(file)
-        project = Project.create(projects.new_directory(self._projects_dir(), title), title,
-                                 self.config["general"]["script_language"], self.config["general"]["native_language"])
-        item = project.add_script(file, title)
-        self._open_project(project)
-        self.openItem(item.id, "prompter")
 
     @Slot(str)
     def openProject(self, path: str) -> None:
@@ -680,23 +618,32 @@ class Controller(QObject):
         if len(project.items) == 1:
             item = project.items[0]
             self.openItem(item.id, "studio" if item.parts else "prompter")
-        elif project.scripts:
-            self.openItem(project.scripts[0].id, "prompter")
+        elif project.items:
+            self.openItem(project.items[0].id, "prompter")
         else:
             self._set_page("project")
 
+    def _busy_recording(self) -> bool:
+        """A recording is running, starting or still being saved: the project can't change under it."""
+        if self._recording or self._finishing or self._starting_video:
+            self.notice.emit("error", "Stop the recording first" if self._recording else "Wait for the recording to finish saving")
+            return True
+        return False
+
     def _open_project(self, project: Project) -> None:
-        if self._recording:
-            self.notice.emit("error", "Stop the recording first")
+        if self._busy_recording():
+            project.close()
             return
         for item in project.items:
             recovered = projects.recover_parts(item)
             if recovered:
                 self.notice.emit("info", f"Recovered {len(recovered)} unfinished recording(s) in {item.title}")
+        self.editor.unload()
+        if self.project is not None and self.project is not project:
+            self.project.close()
         self.project = project
         self.item = None
         self.itemChanged.emit()
-        self.editor.unload()
         self._clear_takes()
         recent = [str(project.path)] + [p for p in self.config["general"].get("recent_projects", []) if p != str(project.path)]
         self.config["general"]["recent_projects"] = recent[:12]
@@ -719,19 +666,6 @@ class Controller(QObject):
             self._refresh_explorer()
             self.openItem(imported[0].id, "prompter")
 
-    @Slot()
-    def newFreeRecording(self) -> None:
-        if self._recording:
-            return
-        if self.project is None:
-            base = self._projects_dir()
-            existing = next((row for row in projects.list_projects(base) if row["title"] == "Free recordings"), None)
-            project = Project.load(Path(existing["path"])) if existing else Project.create(projects.new_directory(base, "Free recordings"), "Free recordings")
-            self._open_project(project)
-        item = self.project.add_free()
-        self._refresh_explorer()
-        self.openItem(item.id, "prompter")
-
     def attach_window(self, window) -> None:
         self._window = window
 
@@ -747,8 +681,7 @@ class Controller(QObject):
         item = self.project.item(item_id)
         if item is None:
             return
-        light = view == "prompter" and item.kind != projects.SCRIPT
-        if self._window is None or light:
+        if self._window is None:
             self._load_item(item, view)
             if then is not None:
                 then()
@@ -778,13 +711,15 @@ class Controller(QObject):
                 self._load_item(item, view)
                 if then is not None:
                     then()
+        except Exception as error:
+            traceback.print_exc()
+            self.notice.emit("error", f"Couldn't open this recording: {type(error).__name__}: {error}")
         finally:
             self._opening = ""
             self.openingChanged.emit()
 
     def _load_item(self, item: Item, view: str) -> None:
-        if self.editor.dirty and self.editor.item is not None:
-            self.editor.save()
+        self.editor.save()
         self.item = item
         self.itemChanged.emit()
         self._pickup = []
@@ -803,24 +738,18 @@ class Controller(QObject):
                     self.seekEditor.emit(part.start)
         if view == "prompter":
             self._clear_takes()
-            if item.kind == projects.SCRIPT and item.script_file is not None and item.script_file.exists():
-                try:
-                    self._load_script(item.script_file)
-                except Exception as error:
-                    self.notice.emit("error", f"Could not read the script: {error}")
-                    return
-                self._mode = SCRIPTED
-                self._resume_position(item)
-                self.setLayout(self._layout_named(self.config["general"].get("layout_scripted")))
-                self._watch(item.script_file)
-                self.runPreflight()
-            else:
-                self.script = None
-                self.script_path = None
-                self._mode = FREE
-                self.paragraphs.set_items([])
-                self.scriptChanged.emit()
-                self.setLayout(self._layout_named(self.config["general"].get("layout_free")))
+            if item.script_file is None or not item.script_file.exists():
+                self.notice.emit("error", f"The script of {item.title} isn't in the project's scripts folder anymore")
+                return
+            try:
+                self._load_script(item.script_file)
+            except Exception as error:
+                self.notice.emit("error", f"Could not read the script: {error}")
+                return
+            self._resume_position(item)
+            self.setLayout(self._layout_named(self.config["general"].get("layout")))
+            self._watch(item.script_file)
+            self.runPreflight()
             self._set_page("session")
             self._state = "ready"
             self.stateChanged.emit()
@@ -850,7 +779,7 @@ class Controller(QObject):
 
     @Slot(str)
     def showView(self, view: str) -> None:
-        """Record or Studio for the open script or free recording."""
+        """Record or Studio for the open script."""
         if self.item is None or self._page == ("session" if view == "record" else "editor"):
             return
         if self._recording or self._starting_video or self._finishing:
@@ -867,7 +796,7 @@ class Controller(QObject):
     def rerecord(self, sentences) -> None:
         """Pickups: back to the prompter with only these sentences queued."""
         item = self.editor.item
-        if item is None or item.kind != projects.SCRIPT or not sentences:
+        if item is None or not sentences:
             return
         if self.editor.dirty:
             self.editor.save()
@@ -949,6 +878,40 @@ class Controller(QObject):
         if self.item is not None and self.item.id == item_id:
             self.openItem(item_id, "prompter")
 
+    @Slot(str, int)
+    def deleteRecording(self, item_id: str, part_index: int) -> None:
+        """Moves one recording to the trash; the later ones close the gap and the edit keeps the rest."""
+        from PySide6.QtCore import QFile
+
+        item = self.project.item(item_id) if self.project else None
+        if item is None or self._recording or self._finishing:
+            return
+        if len(item.parts) <= 1:
+            self.deleteRecordings(item_id)
+            return
+        showing = self.editor.item is not None and self.editor.item.id == item_id
+        if showing:
+            self.editor.unload()
+        files = item.remove_part(part_index)
+        failed = [path.name for path in files if not QFile.moveToTrash(str(path))]
+        if failed:
+            self.notice.emit("error", f"Couldn't move to the trash: {', '.join(failed)}")
+        self._script_meta.pop(str(item.script_file), None)
+        self.notice.emit("info", f"Recording {part_index} of {item.title} moved to the trash")
+        self._refresh_explorer()
+        if showing:
+            self.openItem(item_id, "studio")
+
+    @Slot(str, int)
+    def playRecording(self, item_id: str, part_index: int) -> None:
+        """Opens one raw recording (its video, or its audio) in the system's player."""
+        from PySide6.QtGui import QDesktopServices
+
+        item = self.project.item(item_id) if self.project else None
+        part = next((p for p in item.parts if p.index == part_index), None) if item else None
+        if part is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(part.video or part.audio)))
+
     @Slot(str)
     def reimportItem(self, item_id: str) -> None:
         if self.project is None:
@@ -1017,26 +980,14 @@ class Controller(QObject):
             return
         rows = []
         current = self.item.id if self.item else ""
-        scripts = self.project.scripts
-        free = [i for i in self.project.items if i.kind == projects.FREE]
-        if scripts:
-            rows.append({"kind": "group", "depth": 0, "id": "", "part": 0, "title": QCoreApplication.translate("Explorer", "Scripts"), "detail": "", "expanded": True, "expandable": False, "current": False})
-        for item in scripts:
+        for item in self.project.items:
             _, total = self._script_info(item)
             status = item.status()
             detail = f"{status['recorded']}/{total}" if total else ""
             if status["duration"]:
                 detail += ("  ·  " if detail else "") + self._length(status["duration"])
             expanded = item.id in self._expanded
-            rows.append({"kind": "script", "depth": 1, "id": item.id, "part": 0, "title": item.title, "detail": detail,
-                         "expanded": expanded, "expandable": bool(item.parts), "current": item.id == current})
-            if expanded:
-                rows += self._item_children(item)
-        if free:
-            rows.append({"kind": "group", "depth": 0, "id": "", "part": 0, "title": QCoreApplication.translate("Explorer", "Free recordings"), "detail": "", "expanded": True, "expandable": False, "current": False})
-        for item in free:
-            expanded = item.id in self._expanded
-            rows.append({"kind": "free", "depth": 1, "id": item.id, "part": 0, "title": item.title, "detail": self._length(item.duration) if item.parts else "",
+            rows.append({"kind": "script", "depth": 0, "id": item.id, "part": 0, "title": item.title, "detail": detail,
                          "expanded": expanded, "expandable": bool(item.parts), "current": item.id == current})
             if expanded:
                 rows += self._item_children(item)
@@ -1056,23 +1007,12 @@ class Controller(QObject):
                 recordings += 1
                 label = QCoreApplication.translate("Explorer", "Recording %1").replace("%1", str(recordings))
             when = part.created[5:16].replace("T", " ") if part.created else ""
-            rows.append({"kind": "part", "depth": 2, "id": item.id, "part": part.index, "title": label,
+            rows.append({"kind": "part", "depth": 1, "id": item.id, "part": part.index, "title": label,
                          "detail": f"{when}  ·  {self._length(part.duration)}" if when else self._length(part.duration),
                          "expanded": False, "expandable": False, "current": False})
-        if item.parts:
-            detail = ""
-            if item.edit_path.exists():
-                try:
-                    from ..edit.edl import Edit
-
-                    detail = self._length(Edit.load(item.edit_path).duration)
-                except Exception:
-                    pass
-            rows.append({"kind": "edit", "depth": 2, "id": item.id, "part": 0, "title": QCoreApplication.translate("Explorer", "Edit"),
-                         "detail": detail, "expanded": False, "expandable": False, "current": False})
         exported = [f for f in item.out_dir.iterdir() if f.is_file()] if item.out_dir.is_dir() else []
         if exported:
-            rows.append({"kind": "exports", "depth": 2, "id": item.id, "part": 0, "title": QCoreApplication.translate("Explorer", "Exports"),
+            rows.append({"kind": "exports", "depth": 1, "id": item.id, "part": 0, "title": QCoreApplication.translate("Explorer", "Exports"),
                          "detail": str(len(exported)), "expanded": False, "expandable": False, "current": False})
         return rows
 
@@ -1084,13 +1024,8 @@ class Controller(QObject):
         kind = entry["kind"]
         if kind == "script":
             self.openItem(entry["id"], "prompter")
-        elif kind == "free":
-            item = self.project.item(entry["id"])
-            self.openItem(entry["id"], "studio" if item and item.parts else "prompter")
         elif kind == "part":
             self.openItem(entry["id"], f"part:{entry['part']}")
-        elif kind == "edit":
-            self.openItem(entry["id"], "studio")
         elif kind == "exports":
             self.openExports(entry["id"])
 
@@ -1098,7 +1033,6 @@ class Controller(QObject):
         self.log = None
         self._rehearsal = False
         self.takes.set_items([])
-        self.transcript.set_items([])
         self._coach = {}
         self.coachChanged.emit()
 
@@ -1178,20 +1112,29 @@ class Controller(QObject):
         }
 
     @Slot()
-    def startFree(self) -> None:
-        self.newFreeRecording()
-
-    @Slot()
-    def goStart(self) -> None:
-        if self._recording:
-            self.notice.emit("error", "Stop the recording first")
+    def closeProject(self) -> None:
+        """Home only shows with no project open."""
+        if self._busy_recording():
             return
+        self.editor.unload()
+        if self.project is not None:
+            self.project.close()
+        self.project = None
+        self.item = None
+        self.script = None
+        self.script_path = None
+        self._clear_takes()
+        self.itemChanged.emit()
+        self.projectChanged.emit()
+        self.scriptChanged.emit()
+        self._refresh_explorer()
         self._set_page("start")
 
     def _set_page(self, page: str) -> None:
         self._page = page
         self.pageChanged.emit()
         self._phoneUpdate.emit()
+        self._update_listening()
 
     @Slot()
     def record(self) -> None:
@@ -1204,30 +1147,24 @@ class Controller(QObject):
     def _begin(self, rehearsal: bool) -> None:
         if self._recording or self._finishing or self._starting_video or self._page != "session":
             return
-        if self._mode == SCRIPTED and self.script is None:
+        if self.script is None or self.item is None:
             self.notice.emit("error", "Open a script first")
-            return
-        if not rehearsal and (self.project is None or self.item is None):
-            self.notice.emit("error", "Open a project first")
             return
         self._rehearsal = rehearsal
         pickup = [] if rehearsal else list(self._pickup)
-        pending = None
+        self.log = TakeLog()
         if not rehearsal:
             self._sync_snapshot(self.item)
             self.part_index, self.part_audio = self.item.next_part()
             self.item.folder.mkdir(parents=True, exist_ok=True)
-            pending = self.item.folder / f"part-{self.part_index:03d}.takes.json"
-        self.log = TakeLog(pending)
+            self.log = self.item.recording_log(self.part_index)
         coach = self.config["coach"]
         strictness = self.config["strictness"]
         settings = SessionSettings(
-            mode=self._mode,
             rehearsal=rehearsal,
             coach=CoachSettings(
                 enabled=bool(coach.get("enabled", True)) and self._engines.get("scorer", {}).get("engine") == "wav2vec2",
                 require=float(coach.get("require") or 0) or None,
-                drill=bool(coach.get("drill", True)),
                 drill_times=int(coach.get("drill_times", 3)),
                 threshold=float(coach.get("threshold", 55)),
                 timing=coach.get("timing", "live"),
@@ -1235,36 +1172,37 @@ class Controller(QObject):
             ),
             extra_speech=strictness.get("extra_speech", "between"),
             deviations=strictness.get("deviations", "warn"),
-            punctuated_transcripts=self._engines.get("tracking", {}).get("engine") == "whisper",
         )
         pack = packs.get(self.config["general"]["script_language"])
         listener = _Listener(self)
-        start = self._current_sentence if self._mode == SCRIPTED and self.script is not None else None
-        self.session = Session(self.log, settings, listener, self.script, pack, self._native_pack(), self.history, start, self.lexicon,
-                               pickup=pickup if self._mode == SCRIPTED else None)
+        self.session = Session(self.log, settings, listener, self.script, pack, self._native_pack(), self.history, self._current_sentence, self.lexicon,
+                               pickup=pickup)
         self._coach = {}
         self._review = {}
         self._time = 0.0
-        self._last_chapter_count = 0
         self.coachChanged.emit()
-        self.transcript.set_items([])
         self._recorder_stopped = None
         self.audio_t0 = None
-        if not rehearsal and self._start_video():
-            # Cameras and screen recorders take a moment to start; reading starts only once the video
-            # records, so the first words of a part are never left without picture.
+        if not rehearsal:
+            # Cameras take a moment to start; reading starts only once the video records, so the first
+            # words of a part are never left without picture. The wait is set up before the camera is
+            # asked to record: some encoders report recording at once, inside that call.
             self._starting_video = QCoreApplication.translate("Recording", "Starting the video recording…")
             self.startingVideoChanged.emit()
-            self._video_timer.start()
-            return
-        self._go_live(False)
+            if self._start_video():
+                if self._starting_video:
+                    self._video_timer.start()
+                return
+            self._starting_video = ""
+            self.startingVideoChanged.emit()
+        self._go_live()
 
     def _video_timed_out(self) -> None:
         if self._starting_video:
             self.notice.emit("error", "The video didn't start in time; recording audio only")
-            self._go_live(False)
+            self._go_live()
 
-    def _go_live(self, video_started: bool) -> None:
+    def _go_live(self) -> None:
         self._video_timer.stop()
         if self._starting_video:
             self._starting_video = ""
@@ -1274,13 +1212,17 @@ class Controller(QObject):
         rehearsal = self._rehearsal
         self.processes.send_recorder({"type": "start", "path": None if rehearsal else str(self.part_audio)})
         self._recording = True
-        self.processes.send_engine({"type": "listen", "active": True})
+        self._update_listening()
         self.session.start()
         if not rehearsal:
-            self.resource_log = ResourceLog(self.item.folder / f"part-{self.part_index:03d}.resources.csv")
+            self.resource_log = ResourceLog(paths.recording_log(f"{self._part_name()}.resources.csv"))
             self.monitor.recording_files = [self.part_audio]
         self.stateChanged.emit()
         self.takes_changed()
+
+    def _part_name(self) -> str:
+        """How a recording's diagnostics files are named in the log folder."""
+        return f"{projects.slug(self.project.title)}-{self.item.id}-part-{self.part_index:03d}"
 
     def _sync_snapshot(self, item: Item) -> None:
         """Keeps the item's snapshot equal to its script, re-pointing earlier takes when it changed."""
@@ -1295,66 +1237,34 @@ class Controller(QObject):
 
     def _start_video(self) -> bool:
         """Starts the part's video; True when it's on its way and will report through _videoStarted."""
-        capture_settings = self.config["video"]
-        backend = capture_settings.get("backend", "none")
-        video = self.item.folder / "video"
-        name = f"part-{self.part_index:03d}"
+        source = self.config["camera"].get("source", "none")
         try:
-            if backend == "builtin":
-                if not gsr.available():
-                    raise RuntimeError("gpu-screen-recorder is not installed")
-                capture = capture_settings.get("capture") or self._default_capture()
-                source = self.config["audio"].get("input", "default")
-                self.screen = gsr.ScreenRecorder(
-                    video / f"{name}.mp4", capture, None if source == "default" else source, int(capture_settings.get("fps", 60)),
-                    paths.runtime_dir() / f"gsr-{int(time.time())}.sock", video / f"{name}.gpu-screen-recorder.log",
-                )
-                if source == "default":
-                    self.screen.audio_source = "default_input"
-                threading.Thread(target=self._start_screen, daemon=True).start()
-                self.monitor.bitrate_mbps = 12.0
-                return True
-            if backend == "obs":
-                self.obs = ObsClient(self.config["video"].get("obs_host", "localhost"), int(self.config["video"].get("obs_port", 4455)), self.config["video"].get("obs_password", ""))
-                threading.Thread(target=self._start_obs, daemon=True).start()
-                return True
-            if backend == "camera":
-                from PySide6.QtMultimedia import QMediaDevices
-
+            if source == "device":
                 if not QMediaDevices.videoInputs():
                     raise RuntimeError("no camera found")
-                video.mkdir(parents=True, exist_ok=True)
-                self.camera_file = video / f"{name}.mp4"
+                self.camera_file = self.item.folder / f"part-{self.part_index:03d}.mp4"
                 self.cameraRecord.emit(str(self.camera_file))
                 self.monitor.bitrate_mbps = 10.0
                 return True
-            if backend == "phone" and self._prepare_phone():
+            if source == "phone" and self._prepare_phone():
                 threading.Thread(target=self._start_phone, daemon=True).start()
                 return True
         except Exception as error:
             self.notice.emit("error", f"Video recording did not start: {error}. Recording audio only.")
         return False
 
-    def _start_screen(self) -> None:
-        try:
-            self.screen.start()
-            self._videoStarted.emit(True)
-        except Exception as error:
-            self.notice.emit("error", f"Screen recording failed: {error}. Recording audio only.")
-            self.screen = None
-            self._videoStarted.emit(False)
-
     def _prepare_phone(self) -> bool:
         if not phone_video.available():
             self.notice.emit("error", "scrcpy is not installed (it's in the official repositories: pacman -S scrcpy); recording audio only")
             return False
         name = f"part-{self.part_index:03d}"
-        video = self.item.folder / "video"
-        sink = phone_video.loopback_device() if self.config["video"].get("phone_preview", False) else None
+        video = self.item.folder
+        sink = phone_video.loopback_device() if self.config["phone"].get("preview", False) else None
         phone_settings, note = self._phone_settings()
         if note:
             self.notice.emit("info", f"Phone camera: {note}")
-        self.phone = phone_video.PhoneRecorder(video / f"{name}.mkv", phone_settings, video / f"{name}.scrcpy.log", sink)
+        container = phone_settings.get("container", "mkv")
+        self.phone = phone_video.PhoneRecorder(video / f"{name}.{container}", phone_settings, paths.recording_log(f"{self._part_name()}.scrcpy.log"), sink)
         # Let go of the virtual camera so the recording's scrcpy can give it its own picture size.
         self.phone_frames.stop()
         self.monitor.bitrate_mbps = 40.0
@@ -1393,13 +1303,13 @@ class Controller(QObject):
     def _restart_phone_frames(self) -> None:
         device = phone_video.loopback_device()
         if self._phone_mode() and device and (self.phone_preview is not None or self.phone is not None):
-            self.phone_frames.start(device, phone_video.portrait(self.config["video"]))
+            self.phone_frames.start(device, phone_video.portrait(self._phone_config()))
         else:
             self.phone_frames.stop()
 
     # Phones: each one is known by its adb serial, with its detected cameras and its own settings.
 
-    PHONE_GLOBAL_KEYS = ("phone_serial", "phone_preview")
+    PHONE_GLOBAL_KEYS = ("serial", "preview")
 
     def _phone_cameras_file(self) -> Path:
         return paths.cache_dir() / "phone-cameras.json"
@@ -1426,7 +1336,7 @@ class Controller(QObject):
         return self._active_serial
 
     def _resolve_serial(self) -> str:
-        chosen = self.config["video"].get("phone_serial") or ""
+        chosen = self.config["phone"].get("serial") or ""
         if chosen:
             self._active_serial = chosen
         else:
@@ -1441,9 +1351,9 @@ class Controller(QObject):
 
     def _phone_config(self) -> dict:
         """Phone settings for the active phone: its own values over the shared defaults."""
-        video = self.config["video"]
-        merged = {k: v for k, v in video.items() if k.startswith("phone_")}
-        merged.update((video.get("phones") or {}).get(self._active_serial, {}))
+        phone = self.config["phone"]
+        merged = {k: v for k, v in phone.items() if k != "phones"}
+        merged.update((phone.get("phones") or {}).get(self._active_serial, {}))
         return merged
 
     @Slot()
@@ -1484,7 +1394,7 @@ class Controller(QObject):
         self._resolve_active_phone()
         options, note = phone_video.resolve(self._phone_config(), self._phone_cameras)
         if self._active_serial:
-            options["phone_serial"] = self._active_serial
+            options["serial"] = self._active_serial
         return options, note
 
     def _phone_rows(self) -> list[dict]:
@@ -1536,7 +1446,7 @@ class Controller(QObject):
         self._stop_phone_preview(then_update=True)
 
     def _phone_mode(self) -> bool:
-        return self.config["video"].get("backend") == "phone"
+        return self.config["camera"].get("source") == "phone"
 
     def _update_phone_preview(self) -> None:
         if self._phone_mode() and phone_video.available():
@@ -1588,26 +1498,6 @@ class Controller(QObject):
                 lines.append(f"{device.serial}: {device.state}")
         return "\n".join(lines)
 
-    def _start_obs(self) -> None:
-        try:
-            self.obs.connect()
-            self.obs.start_record()
-            self._videoStarted.emit(True)
-        except ObsError as error:
-            self.notice.emit("error", f"{error}. Recording audio only.")
-            self.obs = None
-            self._videoStarted.emit(False)
-
-    def _default_capture(self) -> str:
-        monitors = hyprland.monitors()
-        if not monitors:
-            return "screen"
-        prompter = self.config["video"].get("camera_monitor") or ""
-        focused = next((m for m in monitors if m.focused), monitors[0])
-        others = [m for m in monitors if m.name != focused.name and m.name != prompter]
-        target = others[0] if others else focused
-        return f"monitor:{target.name}"
-
     @Slot()
     def cameraRecordingFinished(self) -> None:
         self.camera_finished = True
@@ -1619,7 +1509,7 @@ class Controller(QObject):
         if location:
             self.camera_file = Path(QUrl(location).toLocalFile() if location.startswith("file:") else location)
         if self._starting_video:
-            self._go_live(True)
+            self._go_live()
 
     @Slot()
     def stop(self) -> None:
@@ -1627,7 +1517,7 @@ class Controller(QObject):
             return
         self.session.stop()
         self._recording = False
-        self.processes.send_engine({"type": "listen", "active": False})
+        self._update_listening()
         self.processes.send_recorder({"type": "stop"})
         if self.camera_file:
             self.cameraStop.emit()
@@ -1656,20 +1546,8 @@ class Controller(QObject):
         while self._recorder_stopped is None and time.time() < deadline:
             time.sleep(0.05)
         video_path = None
-        if self.screen is not None:
-            self._finishStep.emit(QCoreApplication.translate("Finishing", "Finishing the screen recording…"))
-            video_path = self.screen.stop()
-            self.screen = None
-        if self.obs is not None:
-            self._finishStep.emit(QCoreApplication.translate("Finishing", "Stopping the OBS recording…"))
-            try:
-                output = self.obs.stop_record()
-                video_path = Path(output) if output else None
-            except ObsError as error:
-                self.notice.emit("error", str(error))
-            self.obs.close()
-            self.obs = None
         video_t0 = None
+        from_phone = self.phone is not None
         if self.phone is not None:
             self._finishStep.emit(QCoreApplication.translate("Finishing", "Finishing the phone recording…"))
             video_path = self.phone.stop()
@@ -1684,7 +1562,7 @@ class Controller(QObject):
             if self.camera_file.exists() and self.camera_file.stat().st_size > 0:
                 video_path = self.camera_file
             self.camera_file = None
-        job["trim"] = video_path is not None and video_path.suffix == ".mkv" or job.get("trim", False)
+        job["trim"] = video_path is not None and from_phone
         audio = Path(job["audio"])
         duration = float((self._recorder_stopped or {}).get("duration", 0.0)) or projects.audio_duration(audio)
         job.update({"duration": duration, "t0": self.audio_t0, "video": None, "offset": 0.0, "method": "none"})
@@ -1698,6 +1576,7 @@ class Controller(QObject):
                 except RuntimeError as error:
                     self.notice.emit("error", f"Couldn't prepare the phone video: {error}")
             offset, method = media.estimate_offset(audio, video_path, self.audio_t0, video_t0=video_t0)
+            video_path.with_name(video_path.name + ".ts").unlink(missing_ok=True)
             job.update({"video": str(video_path), "offset": offset, "method": method})
             if job.get("trim"):
                 job["segments"] = self._trim_video(video_path, duration, offset)
@@ -1730,19 +1609,16 @@ class Controller(QObject):
             if item is None:
                 return
             index, audio = job["index"], Path(job["audio"])
-            pending = item.folder / f"part-{index:03d}.takes.json"
-            part_log = TakeLog.load(pending) if pending.exists() else (self.log or TakeLog())
-            added = projects.merge_takes(item.load_takes(), part_log, item.duration)
+            part_log = item.unfinished_recording(index) or self.log or TakeLog()
             pickup = job.get("pickup") or []
-            item.add_part(
-                index, audio, job["duration"], kind="pickup" if pickup else "recording",
+            had_edit = item.load_edit() is not None
+            added = item.finish_recording(
+                part_log, index, audio, job["duration"], kind="pickup" if pickup else "recording",
                 video=Path(job["video"]) if job.get("video") else None, video_offset=job.get("offset", 0.0),
                 video_method=job.get("method", "none"), t0_monotonic=job.get("t0"), sentences=pickup or None,
                 engines={role: info.get("engine") for role, info in self._engines.items()}, video_segments=job.get("segments"),
             )
-            pending.unlink(missing_ok=True)
             recorded = {t.sentence for t in added if t.status == COMPLETE and t.sentence is not None}
-            had_edit = item.edit_path.exists()
             self.item = item
             self.itemChanged.emit()
             self._pickup = []
@@ -1755,8 +1631,6 @@ class Controller(QObject):
                 self.editor.save()
                 if updated:
                     self.notice.emit("info", f"New takes swapped in for {self._sentence_list(updated)}")
-            elif self.config["edit"].get("auto_on_stop"):
-                self.editor.autoEdit()
             self._set_page("editor")
             self._refresh_explorer()
         finally:
@@ -1832,9 +1706,8 @@ class Controller(QObject):
             return
         self._layout = layout
         self._panels = dict(LAYOUTS[layout])
-        key = "layout_free" if self._mode == FREE else "layout_scripted"
-        if self.config["general"].get(key) != layout:
-            self.config["general"][key] = layout
+        if self.config["general"].get("layout") != layout:
+            self.config["general"]["layout"] = layout
             config_module.save(self.config)
         self.layoutChanged.emit()
 
@@ -1853,8 +1726,8 @@ class Controller(QObject):
 
     @Slot(str, str, "QVariant")
     def setSetting(self, section: str, key: str, value) -> None:
-        if section == "video" and key.startswith("phone_") and key not in self.PHONE_GLOBAL_KEYS and self._active_serial:
-            phones = self.config["video"].setdefault("phones", {})
+        if section == "phone" and key not in self.PHONE_GLOBAL_KEYS and self._active_serial:
+            phones = self.config["phone"].setdefault("phones", {})
             if self._phone_config().get(key) == value:
                 return
             phones.setdefault(self._active_serial, {})[key] = value
@@ -1873,12 +1746,14 @@ class Controller(QObject):
             self.config["coach"]["require"] = value
         config_module.save(self.config)
         self.settingsChanged.emit()
-        if section == "video" and key == "phone_serial":
+        if section == "phone" and key == "serial":
             self._resolve_active_phone()
             self.phoneCamerasChanged.emit()
             self.settingsChanged.emit()
-        if section == "video" and key.startswith("phone_") and not self._recording:
+        if section == "phone" and not self._recording:
             self._restart_phone_preview()
+        if section == "camera" and key == "source":
+            self._phoneUpdate.emit()
         if section == "guides":
             self._rebuild_paragraphs()
         elif section == "prompter" and key == "mode":
@@ -1893,8 +1768,6 @@ class Controller(QObject):
             self.enginePendingChanged.emit()
         elif section == "general" and key == "native_language" and self.script_path:
             self._load_script(self.script_path)
-        elif section == "video" and key == "camera_layout":
-            self.camera(value)
 
     @Slot()
     def restartEngine(self) -> None:
@@ -1914,11 +1787,8 @@ class Controller(QObject):
         pack = packs.get(self.config["general"]["script_language"])
         wake = self.config["voice"].get("wake_word") or packs.get(self._engine_settings.get("commands_language", pack.code)).wake_word
         errors = {role: info.get("detail", "") for role, info in self._engines.items() if info.get("state") == "error"}
-        issues = preflight.check(
-            self.script, self.guides, pack, wake, self.config["video"].get("backend", "none"),
-            self._obs_scene_list or None, engine_settings.missing_models(self.config), errors,
-        )
-        vram_needed, ram_needed = estimate_preset(self._engine_settings)
+        issues = preflight.check(self.script, self.guides, pack, wake, engine_settings.missing_models(self.config), errors)
+        vram_needed, _ = estimate_preset(self._engine_settings)
         snapshot = self._resources.get("_snapshot")
         if snapshot is not None and vram_needed and snapshot.gpu.memory_total_mb:
             free = snapshot.gpu.memory_total_mb - (snapshot.gpu.memory_used_mb or 0)
@@ -1928,53 +1798,26 @@ class Controller(QObject):
         self._preflight = [i.as_dict() for i in issues]
         self.preflightChanged.emit()
 
-    def _set_obs_scenes(self, scenes) -> None:
-        self._obs_scene_list = list(scenes or [])
-        self.devicesChanged.emit()
-
-    @Slot()
-    def refreshObs(self) -> None:
-        video = self.config["video"]
-
-        def work():
-            client = ObsClient(video.get("obs_host", "localhost"), int(video.get("obs_port", 4455)), video.get("obs_password", ""))
-            try:
-                client.connect()
-                self._obsScenes.emit(client.scenes())
-                self.notice.emit("info", "Connected to OBS")
-            except ObsError as error:
-                self.notice.emit("error", str(error))
-            finally:
-                client.close()
-
-        threading.Thread(target=work, daemon=True).start()
-
     @Slot()
     def refreshDevices(self) -> None:
         self.processes.send_recorder({"type": "sources"})
-        self._refresh_monitors()
 
-    def _refresh_monitors(self) -> None:
-        self._monitors = [{"name": m.name, "size": f"{m.width}×{m.height}", "description": m.description} for m in hyprland.monitors()]
-        if not self._monitors:
-            self._monitors = [{"name": name, "size": size, "description": ""} for name, size in gsr.monitors()]
-        self.devicesChanged.emit()
-
-    @Slot()
-    def placeCamera(self) -> None:
-        layout = self._camera_layout
-        if layout == "off":
-            return
-        name = self.config["video"].get("capture", "") or self._default_capture()
-        monitor_name = name.split(":", 1)[1] if name.startswith("monitor:") else ""
-        target = hyprland.monitor(monitor_name) if monitor_name else None
-        if target is None:
-            monitors = hyprland.monitors()
-            target = monitors[0] if monitors else None
-        if target is None:
-            return
-        geometry = hyprland.camera_geometry(target, layout)
-        QTimer.singleShot(150, lambda: hyprland.place(CAMERA_TITLE, geometry))
+    def _video_cameras(self) -> list[dict]:
+        """The cameras to choose from: every video device but the phone's virtual camera and
+        infrared sensors. A laptop's face-login sensor shows up as a second camera with the same
+        name that only gives a grey picture."""
+        grey = {QVideoFrameFormat.PixelFormat.Format_Y8, QVideoFrameFormat.PixelFormat.Format_Y16}
+        cameras = []
+        for device in QMediaDevices.videoInputs():
+            formats = device.videoFormats()
+            if device.description() == phone_video.LOOPBACK_LABEL or (formats and all(f.pixelFormat() in grey for f in formats)):
+                continue
+            cameras.append({"id": bytes(device.id()).decode(), "description": device.description(), "default": device.isDefault()})
+        names = [camera["description"] for camera in cameras]
+        for camera in cameras:
+            if names.count(camera["description"]) > 1:
+                camera["description"] += f" ({camera['id']})"
+        return cameras
 
     @Slot(QObject, QObject)
     def forwardFrames(self, source_output: QObject, target_output: QObject) -> None:
@@ -1984,13 +1827,6 @@ class Controller(QObject):
             return
         source.videoFrameChanged.connect(lambda frame, sink=target: sink.setVideoFrame(frame))
         self._frame_links = getattr(self, "_frame_links", []) + [(source, target)]
-
-    @Slot(str)
-    def setCameraLayout(self, layout: str) -> None:
-        if self.session is not None and self._recording:
-            self.session.handle(f"camera_{layout}", time=self._time)
-        else:
-            self.camera(layout)
 
     def _refresh_models(self) -> None:
         rows = []
@@ -2065,7 +1901,7 @@ class Controller(QObject):
         self._refresh_models()
 
     def _sample_resources(self) -> None:
-        self.monitor.watch(self.processes.pids() | ({"recorder (video)": self.screen.process.pid} if self.screen and self.screen.process else {}))
+        self.monitor.watch(self.processes.pids())
         snapshot = self.monitor.sample()
         summary = snapshot.summary()
         summary["disk_minutes"] = round(self.monitor.disk_minutes(snapshot))
@@ -2090,7 +1926,7 @@ class Controller(QObject):
 
     @Slot(result=bool)
     def canQuit(self) -> bool:
-        return self._closing or (not self._recording and not self.editor.dirty)
+        return self._closing or not self._recording
 
     @Slot()
     def shutdown(self) -> None:
@@ -2099,6 +1935,7 @@ class Controller(QObject):
         self._closing = True
         if self._recording:
             self.stop()
+        self.editor.save()
         if self.pedal:
             self.pedal.stop()
         self.phone_frames.stop()
@@ -2108,15 +1945,17 @@ class Controller(QObject):
         self.processes.shutdown()
 
     @Slot()
-    def copyHyprlandSnippet(self) -> None:
-        QGuiApplication.clipboard().setText(hyprland.config_snippet())
-        self.notice.emit("info", "Hyprland snippet copied; paste it into ~/.config/hypr/bindings.lua")
-
-    @Slot()
     def openProjectsFolder(self) -> None:
         folder = Path(self.config["general"]["projects_dir"]).expanduser()
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    @Slot()
+    def clearPracticeHistory(self) -> None:
+        self.history.clear()
+        self.history.save()
+        self._rebuild_paragraphs()
+        self.notice.emit("info", "Coach history cleared")
 
     @Slot(result="QVariant")
     def drillList(self):
@@ -2147,9 +1986,10 @@ class Controller(QObject):
             items = project.items
             rows.append({
                 "path": path, "title": project.title,
-                "scripts": sum(1 for i in items if i.kind == projects.SCRIPT),
+                "scripts": len(items),
                 "duration": sum(i.duration for i in items),
             })
+            project.close()
         return rows
 
     def _effective_settings(self) -> dict:
@@ -2157,9 +1997,7 @@ class Controller(QObject):
         if self._settings_cache is not None:
             return self._settings_cache
         merged = dict(self.config)
-        video = dict(self.config["video"])
-        video.update(self._phone_config())
-        merged["video"] = video
+        merged["phone"] = self._phone_config()
         self._settings_cache = merged
         return merged
 
@@ -2213,7 +2051,6 @@ class Controller(QObject):
     finishing = Property(str, lambda self: self._finishing, notify=finishingChanged)
     startingVideo = Property(str, lambda self: self._starting_video, notify=startingVideoChanged)
     opening = Property(str, lambda self: self._opening, notify=openingChanged)
-    transcriptModel = Property(QObject, lambda self: self.transcript, constant=True)
     currentSentence = Property(int, lambda self: self._current_sentence, notify=positionChanged)
     currentWord = Property(int, lambda self: self._current_word, notify=positionChanged)
     currentParagraph = Property(int, lambda self: self.script.sentences[self._current_sentence].paragraph if self.script and self._current_sentence < len(self.script.sentences) else 0, notify=positionChanged)
@@ -2230,11 +2067,9 @@ class Controller(QObject):
     review = Property("QVariant", lambda self: self._review, notify=coachChanged)
     drill = Property("QVariant", lambda self: self._drill, notify=drillChanged)
     wordMarks = Property("QVariant", lambda self: self._word_marks, notify=drillChanged)
-    partial = Property(str, lambda self: self._transcript_partial, notify=transcriptChanged)
     preflightIssues = Property("QVariant", lambda self: self._preflight, notify=preflightChanged)
     audioSources = Property("QVariant", lambda self: self._sources, notify=devicesChanged)
-    monitors = Property("QVariant", lambda self: self._monitors, notify=devicesChanged)
-    obsScenes = Property("QVariant", lambda self: self._obs_scene_list, notify=devicesChanged)
+    videoCameras = Property("QVariant", _video_cameras, notify=devicesChanged)
     recentProjects = Property("QVariant", _recent_projects, notify=recentChanged)
     hasProject = Property(bool, lambda self: self.project is not None, notify=projectChanged)
     projectTitle = Property(str, lambda self: self.project.title if self.project else "", notify=projectChanged)
@@ -2244,16 +2079,13 @@ class Controller(QObject):
     explorerModel = Property(QObject, lambda self: self.explorer, constant=True)
     pickupPending = Property(bool, lambda self: bool(self._pickup) and not self._recording, notify=coachChanged)
     phonePreviewActive = Property(bool, lambda self: self.phone_frames.active, notify=phonePreviewChanged)
-    cameraLayout = Property(str, lambda self: self._camera_layout, notify=cameraChanged)
-    videoBackend = Property(str, lambda self: self.config["video"].get("backend", "none"), notify=settingsChanged)
+    cameraSource = Property(str, lambda self: self.config["camera"].get("source", "none"), notify=settingsChanged)
     phoneMode = Property(bool, lambda self: self._phone_mode(), notify=settingsChanged)
-    phonePortrait = Property(bool, lambda self: self._phone_mode() and phone_video.portrait(self.config["video"]), notify=settingsChanged)
+    phonePortrait = Property(bool, lambda self: self._phone_mode() and phone_video.portrait(self._phone_config()), notify=settingsChanged)
     phoneCameras = Property("QVariant", _camera_rows, notify=phoneCamerasChanged)
     phoneDevices = Property("QVariant", _phone_rows, notify=phoneCamerasChanged)
-    activePhone = Property(str, lambda self: self._active_serial, notify=phoneCamerasChanged)
     detectingPhoneCameras = Property(bool, lambda self: self._detecting, notify=phoneCamerasChanged)
     phoneLoopback = Property(bool, lambda self: phone_video.loopback_device() is not None, notify=settingsChanged)
-    hyprlandAvailable = Property(bool, lambda self: hyprland.available(), constant=True)
     cameraAllowed = Property(bool, lambda self: not os.environ.get("RETAKE_NO_CAMERA"), constant=True)
     languages = Property("QVariant", lambda self: [{"code": p.code, "name": p.name} for p in packs.all_packs().values()], constant=True)
 
@@ -2273,9 +2105,6 @@ class _Listener:
 
     def takes_changed(self):
         self.controller.takes_changed()
-
-    def transcript_changed(self, partial):
-        self.controller.transcript_changed(partial)
 
     def coach_feedback(self, take, flagged, deviations):
         self.controller.coach_feedback(take, flagged, deviations)
@@ -2297,6 +2126,9 @@ class _Listener:
 
     def drill_changed(self, drill):
         self.controller.drill_changed(drill)
+
+    def stop_requested(self):
+        QTimer.singleShot(0, self.controller.stop)
 
     def marks_changed(self, red, warned):
         self.controller.marks_changed(red, warned)

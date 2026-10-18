@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from ..session import takes as kinds
-from ..session.takes import COMPLETE, Take, TakeLog
-from .edl import Edit
+from ..session.takes import COMPLETE, REJECTED, Take, TakeLog
+from .edl import Clip, Edit
+
+
+BLOCK_CONTEXT = 1.0
 
 
 @dataclass
@@ -16,7 +19,6 @@ class Rules:
     extra_speech: str = "between"
     crossfade_ms: int = 15
     camera_crossfade_ms: int = 0
-    order: str = "source"
 
     @classmethod
     def from_config(cls, edit: dict, strictness: dict) -> Rules:
@@ -28,7 +30,6 @@ class Rules:
             extra_speech=strictness.get("extra_speech", "between"),
             crossfade_ms=int(edit.get("crossfade_ms", 15)),
             camera_crossfade_ms=int(edit.get("camera_crossfade_ms", 0)),
-            order=edit.get("order", "source"),
         )
 
 
@@ -37,10 +38,7 @@ def _choose(takes: list[Take], keep: str) -> Take:
         scored = [t for t in takes if t.score is not None]
         if scored:
             return max(scored, key=lambda t: (t.score, t.id))
-    preferred = [t for t in takes if t.preferred]
-    if preferred:
-        return preferred[-1]
-    return takes[-1]
+    return max(takes, key=lambda t: t.id)
 
 
 def _subtract(ranges: list[tuple[float, float]], holes: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -98,7 +96,7 @@ def _good_takes(log: TakeLog) -> dict[int | None, list[Take]]:
 
 def auto_edit(log: TakeLog, duration: float, rules: Rules, boundaries: list[float] | None = None) -> Edit:
     boundaries = sorted(boundaries or [])
-    edit = Edit(source_duration=duration, order=rules.order, crossfade_ms=rules.crossfade_ms, camera_crossfade_ms=rules.camera_crossfade_ms, rules=rules.__dict__.copy())
+    edit = Edit(source_duration=duration, crossfade_ms=rules.crossfade_ms, camera_crossfade_ms=rules.camera_crossfade_ms, rules=rules.__dict__.copy())
     grouped = _good_takes(log)
     chosen: list[Take] = list(grouped.pop(None, []))
     for sentence_takes in grouped.values():
@@ -122,25 +120,72 @@ def auto_edit(log: TakeLog, duration: float, rules: Rules, boundaries: list[floa
 
 
 def update_sentences(edit: Edit, log: TakeLog, sentences: set[int], rules: Rules, duration: float, boundaries: list[float] | None = None) -> list[int]:
-    """Swaps in the chosen take for each of these sentences and leaves the rest of the edit alone,
-    so a pickup or a later recording doesn't undo hand edits elsewhere."""
-    boundaries = sorted(boundaries or [])
+    """Puts the newest take (or the best, with keep="best") of each of these sentences in the edit
+    and leaves the rest alone, so a pickup or a later recording doesn't undo hand edits elsewhere.
+    Returns the sentences whose take changed."""
     grouped = _good_takes(log)
-    removable = _removable(log, rules)
-    adlibs = [(m.start, m.end) for m in log.markers_of(kinds.ADLIB)]
     edit.source_duration = duration
     updated = []
     for sentence in sorted(sentences):
         takes = grouped.get(sentence)
-        if not takes:
-            continue
-        take = _choose(takes, rules.keep)
-        edit.clips = [c for c in edit.clips if c.sentence != sentence]
-        _take_clips(edit, take, rules, duration, removable, adlibs, _limits(take, boundaries, duration))
-        updated.append(sentence)
+        if takes and use_take(edit, log, _choose(takes, rules.keep), rules, duration, boundaries):
+            updated.append(sentence)
+    return updated
+
+
+def take_choices(log: TakeLog, sentence: int) -> list[Take]:
+    """The takes a sentence can use: finished ones newest first, then the rejected ones (often fine
+    but for one word the coach didn't like)."""
+    finished = [t for t in log.takes if t.sentence == sentence and t.end is not None]
+    complete = sorted((t for t in finished if t.status == COMPLETE), key=lambda t: -t.id)
+    rejected = sorted((t for t in finished if t.status == REJECTED), key=lambda t: -t.id)
+    return complete + rejected
+
+
+def use_take(edit: Edit, log: TakeLog, take: Take, rules: Rules, duration: float, boundaries: list[float] | None = None) -> bool:
+    """Puts this take in its sentence's place. The clips of the take it replaces are kept aside and
+    come back, trims and all, if that take is chosen again. Returns whether anything changed."""
+    sentence = take.sentence
+    current = [c for c in edit.clips if c.sentence == sentence]
+    if current and all(c.take == take.id for c in current):
+        return False
+    for take_id in {c.take for c in current if c.take is not None}:
+        edit.alternates[str(take_id)] = [asdict(c) for c in current if c.take == take_id]
+    edit.clips = [c for c in edit.clips if c.sentence != sentence]
+    saved = edit.alternates.pop(str(take.id), None)
+    if saved:
+        for data in saved:
+            edit.clips.append(Clip(**{**data, "id": edit.next_id}))
+            edit.next_id += 1
+    else:
+        boundaries = sorted(boundaries or [])
+        adlibs = [(m.start, m.end) for m in log.markers_of(kinds.ADLIB)]
+        _take_clips(edit, take, rules, duration, _removable(log, rules), adlibs, _limits(take, boundaries, duration))
     edit.clips.sort(key=lambda c: (c.start, c.id))
     edit.normalize()
-    return updated
+    return True
+
+
+def take_blocks(edit: Edit, log: TakeLog, rules: Rules, duration: float, boundaries: list[float] | None = None) -> list[tuple[float, float, list[Clip], Take | None]]:
+    """The edit as whole takes, in the order it plays: each take in use with a second around it
+    (room to pull a trim out), within its recording, and the clips kept from it. A clip that isn't a
+    sentence's take is a block of its own."""
+    boundaries = sorted(boundaries or [])
+    takes = {t.id: t for t in log.takes}
+    groups: dict[tuple, list[Clip]] = {}
+    for clip in edit.timeline():
+        key = (clip.sentence, clip.take) if clip.sentence is not None and clip.take in takes else ("clip", clip.id)
+        groups.setdefault(key, []).append(clip)
+    blocks = []
+    for key, clips in groups.items():
+        start, end = min(c.start for c in clips), max(c.end for c in clips)
+        take = takes[key[1]] if key[0] != "clip" else None
+        if take is not None:
+            low, high = _limits(take, boundaries, duration)
+            start = min(start, max(low, take.start - max(rules.handle_before, BLOCK_CONTEXT)))
+            end = max(end, min(high, duration, (take.end or take.start) + max(rules.handle_after, BLOCK_CONTEXT)))
+        blocks.append((start, end, clips, take))
+    return blocks
 
 
 def edit_clip(edit: Edit, start: float, end: float, take: Take | None, kind: str):
@@ -158,12 +203,3 @@ def _close_small_gaps(edit: Edit, max_pause: float, removable: list[tuple[float,
         crosses = any(left.end < b <= right.start for b in boundaries or [])
         if 0 < gap <= max_pause and not crosses and not any(a < right.start and b > left.end for a, b in removable):
             left.end = right.start
-
-
-def flag_screen_changes(edit: Edit, changes: list[float]) -> list[tuple[float, float]]:
-    flagged = []
-    clips = sorted(edit.clips, key=lambda c: c.start)
-    for left, right in zip(clips, clips[1:]):
-        if any(left.end < t < right.start for t in changes):
-            flagged.append((left.end, right.start))
-    return flagged

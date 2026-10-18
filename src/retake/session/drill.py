@@ -10,6 +10,8 @@ UNCOACHED = "uncoached"
 
 # How long to wait for the reference voice before listening anyway (TTS can fail or be slow).
 VOICE_TIMEOUT = 4.0
+# A drill asked for (D, "retake, drill it") runs even with the automatic drill off, this many times.
+ON_DEMAND_TIMES = 3
 SHORTEST_ATTEMPT = 0.2
 # A try this long may be a voice command ("retake, skip it") rather than the word; its score waits
 # this long for the command to show up before it counts.

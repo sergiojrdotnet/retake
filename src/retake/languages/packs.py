@@ -11,7 +11,7 @@ from ..phonetics.respell import RespellingTable
 
 COMMAND_ACTIONS = (
     "again", "next", "back", "pause", "resume", "mark", "stop", "listen",
-    "camera_full", "camera_corner", "camera_off", "skip", "uncoach", "drill",
+    "skip", "uncoach", "drill", "record", "rehearse",
 )
 
 

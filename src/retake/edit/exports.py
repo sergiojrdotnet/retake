@@ -9,7 +9,6 @@ from ..session import takes as kinds
 from ..session.takes import TakeLog
 from .edl import Edit
 
-MAX_LINE = 42
 MAX_CUE = 6.0
 
 
@@ -36,12 +35,12 @@ def edited_words(log: TakeLog, edit: Edit) -> list[tuple[float, float, str]]:
     return words
 
 
-def cues(words: list[tuple[float, float, str]]) -> list[tuple[float, float, list[tuple[float, float, str]]]]:
+def cues(words: list[tuple[float, float, str]], line: int = 42, lines: int = 2) -> list[tuple[float, float, list[tuple[float, float, str]]]]:
     result = []
     current: list[tuple[float, float, str]] = []
     for word in words:
         text = " ".join(w[2] for w in current + [word])
-        too_long = len(text) > MAX_LINE * 2 or (current and word[1] - current[0][0] > MAX_CUE)
+        too_long = len(text) > line * lines or (current and word[1] - current[0][0] > MAX_CUE)
         if current and (too_long or word[0] - current[-1][1] > 1.0):
             result.append((current[0][0], current[-1][1], current))
             current = []
@@ -54,36 +53,110 @@ def cues(words: list[tuple[float, float, str]]) -> list[tuple[float, float, list
     return result
 
 
-def _wrap(text: str) -> str:
-    if len(text) <= MAX_LINE:
-        return text
+def _wrap(text: str, line: int = 42) -> list[str]:
+    if len(text) <= line:
+        return [text]
     words = text.split()
-    best = len(words) // 2
-    return " ".join(words[:best]) + "\n" + " ".join(words[best:])
+    split = min(range(1, len(words)), key=lambda i: max(len(" ".join(words[:i])), len(" ".join(words[i:]))), default=1)
+    return [" ".join(words[:split]), " ".join(words[split:])]
 
 
-def webvtt(words: list[tuple[float, float, str]], karaoke: bool = False) -> str:
-    lines = ["WEBVTT", ""]
-    for index, (start, end, group) in enumerate(cues(words), 1):
-        lines.append(str(index))
-        lines.append(f"{_stamp(start)} --> {_stamp(end)}")
+def webvtt(words: list[tuple[float, float, str]], karaoke: bool = False, line: int = 42, lines: int = 2) -> str:
+    rows = ["WEBVTT", ""]
+    for index, (start, end, group) in enumerate(cues(words, line, lines), 1):
+        rows.append(str(index))
+        rows.append(f"{_stamp(start)} --> {_stamp(end)}")
         if karaoke:
-            body = " ".join(f"<{_stamp(w[0])}>{w[2]}" for w in group)
+            rows.append(" ".join(f"<{_stamp(w[0])}>{w[2]}" for w in group))
         else:
-            body = _wrap(" ".join(w[2] for w in group))
-        lines.append(body)
-        lines.append("")
-    return "\n".join(lines)
+            rows += _wrap(" ".join(w[2] for w in group), line)
+        rows.append("")
+    return "\n".join(rows)
 
 
-def srt(words: list[tuple[float, float, str]]) -> str:
-    lines = []
-    for index, (start, end, group) in enumerate(cues(words), 1):
-        lines.append(str(index))
-        lines.append(f"{_stamp(start, ',')} --> {_stamp(end, ',')}")
-        lines.append(_wrap(" ".join(w[2] for w in group)))
-        lines.append("")
-    return "\n".join(lines)
+def srt(words: list[tuple[float, float, str]], line: int = 42, lines: int = 2) -> str:
+    rows = []
+    for index, (start, end, group) in enumerate(cues(words, line, lines), 1):
+        rows.append(str(index))
+        rows.append(f"{_stamp(start, ',')} --> {_stamp(end, ',')}")
+        rows += _wrap(" ".join(w[2] for w in group), line)
+        rows.append("")
+    return "\n".join(rows)
+
+
+def _ass_time(seconds: float) -> str:
+    hundredths = round(max(0.0, seconds) * 100)
+    hours, rest = divmod(hundredths, 360000)
+    minutes, rest = divmod(rest, 6000)
+    secs, fraction = divmod(rest, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{fraction:02d}"
+
+
+def ass(words: list[tuple[float, float, str]], width: int, height: int, line: int = 42, lines: int = 2) -> str:
+    """Captions styled for burning into a picture of this size: sized on its short side, so portrait
+    and landscape get the same lettering."""
+    portrait = height > width
+    size = round(min(width, height) * 0.05)
+    side = round(width * 0.05)
+    # Shorts and Reels cover the bottom fifth of a portrait video with their own buttons.
+    bottom = round(height * (0.22 if portrait else 0.07))
+    rows = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}", "WrapStyle: 2", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,Sans,{size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{max(2, round(size / 14))},0,2,{side},{side},{bottom},1",
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for start, end, group in cues(words, line, lines):
+        text = " ".join(w[2] for w in group).replace("{", "(").replace("}", ")").replace("\\", "/")
+        rows.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,," + r"\N".join(_wrap(text, line)))
+    return "\n".join(rows) + "\n"
+
+
+def transcript(words: list[tuple[float, float, str]]) -> str:
+    """The edited narration as plain text: a line per sentence, a blank line where you paused."""
+    rows: list[str] = []
+    current: list[str] = []
+    previous_end = None
+    for start, end, text in words:
+        if previous_end is not None and start - previous_end > 2.0:
+            if current:
+                rows.append(" ".join(current))
+                current = []
+            if rows and rows[-1]:
+                rows.append("")
+        current.append(text)
+        if text.endswith((".", "?", "!")):
+            rows.append(" ".join(current))
+            current = []
+        previous_end = end
+    if current:
+        rows.append(" ".join(current))
+    return "\n".join(rows) + "\n"
+
+
+CAPTION_FORMATS = {
+    "srt": "captions.srt",
+    "vtt": "captions.vtt",
+    "vtt-words": "captions-words.vtt",
+    "txt": "transcript.txt",
+}
+
+
+def captions_file(words: list[tuple[float, float, str]], settings: dict) -> tuple[str, str]:
+    """The file name and text for the Captions export with its remembered choices (config [export])."""
+    fmt = settings["captions_format"]
+    line, lines = int(settings["caption_line"]), int(settings["caption_lines"])
+    if fmt == "vtt":
+        text = webvtt(words, line=line, lines=lines)
+    elif fmt == "vtt-words":
+        text = webvtt(words, karaoke=True, line=line, lines=lines)
+    elif fmt == "txt":
+        text = transcript(words)
+    else:
+        text = srt(words, line, lines)
+    return CAPTION_FORMATS[fmt], text
 
 
 def audacity_labels(log: TakeLog) -> str:
@@ -99,9 +172,30 @@ def audacity_labels(log: TakeLog) -> str:
     return "".join(f"{a:.6f}\t{b:.6f}\t{text}\n" for a, b, text in rows)
 
 
-def chapters(log: TakeLog, edit: Edit | None) -> list[tuple[float, str]]:
-    result = []
-    for marker in log.markers_of(kinds.CHAPTER, kinds.MARK):
+def section_starts(script, edit: Edit) -> list[tuple[float, str]]:
+    """Where each of the script's sections starts on the edit's timeline: at its first kept
+    sentence, whichever recording that came from."""
+    starts = []
+    seen: set[int] = set()
+    position = 0.0
+    for clip in edit.timeline():
+        if clip.sentence is not None and clip.sentence < len(script.sentences):
+            section = script.sentences[clip.sentence].section
+            if section >= 0 and section not in seen:
+                seen.add(section)
+                starts.append((position, script.sections[section].title))
+        position += clip.duration
+    return starts
+
+
+def chapters(log: TakeLog, edit: Edit | None, script=None) -> list[tuple[float, str]]:
+    """Chapter starts on the edit's timeline: the script's sections, plus the marks you dropped while
+    recording. The chapter markers logged while reading aren't used: every recording logs its own,
+    at its first take of a section, whether or not that take made the edit. Without the script
+    (unreadable), the logged markers are all there is."""
+    scripted = script is not None and edit is not None
+    result = section_starts(script, edit) if scripted else []
+    for marker in log.markers_of(*((kinds.MARK,) if scripted else (kinds.CHAPTER, kinds.MARK))):
         when = marker.start
         if edit is not None:
             clip = edit.clip_at(when)
@@ -167,57 +261,70 @@ def _marker(name: str, start: float, rate: float, color: str = "RED", comment: s
     }
 
 
-def otio(
-    log: TakeLog,
-    edit: Edit | None,
-    sources: list,
-    video_durations: dict | None = None,
-    rate: float = 30.0,
-    name: str = "retake",
-) -> str:
-    """sources are render.Source entries: each recording's audio, video and place on the timeline."""
-    video_durations = video_durations or {}
-    with_video = any(source.video is not None for source in sources)
+def _spans(edit: Edit | None, sources: list):
+    """The pieces a timeline places, in order: (label, source, time in the source's audio, length,
+    where it lands on the timeline)."""
     if edit is not None:
         spans = [(c.start, c.end, c.label or f"clip {c.id}") for c in edit.timeline()]
     else:
         spans = [(source.start, source.end, source.audio.stem) for source in sources]
-    audio_clips, video_clips = [], []
+    position = 0.0
     for start, end, label in spans:
         for source in sources:
             piece_start, piece_end = max(start, source.start), min(end, source.end)
             if piece_end - piece_start <= 1e-6:
                 continue
-            local = piece_start - source.start
-            length = piece_end - piece_start
-            audio_clips.append({
-                "OTIO_SCHEMA": "Clip.1", "metadata": {}, "name": label, "source_range": _range(local, length, rate),
-                "effects": [], "markers": [], "media_reference": _reference(source.audio, source.duration, rate),
-            })
-            if not with_video:
-                continue
-            if source.video is None:
-                video_clips.append({"OTIO_SCHEMA": "Gap.1", "metadata": {}, "name": "", "source_range": _range(0.0, length, rate), "effects": [], "markers": []})
-                continue
-            video_clips.append({
-                "OTIO_SCHEMA": "Clip.1", "metadata": {}, "name": label,
-                "source_range": _range(max(0.0, local - source.offset_at(local)), length, rate), "effects": [], "markers": [],
-                "media_reference": _reference(source.video, video_durations.get(source.video) or source.duration, rate),
-            })
-    markers = []
-    colors = {kinds.CHAPTER: "BLUE", kinds.MARK: "BLUE", kinds.OFF_SCRIPT: "YELLOW", kinds.FLAG: "RED", kinds.CAMERA: "PURPLE", kinds.SCENE: "PURPLE"}
+            yield label, source, piece_start - source.start, piece_end - piece_start, position
+            position += piece_end - piece_start
+
+
+def _video_time(source, local: float) -> float:
+    return max(0.0, local - source.offset_at(local))
+
+
+def _timeline_markers(log: TakeLog, edit: Edit | None, script=None) -> list[tuple[float, str, str, str]]:
+    """(time, name, color, comment) for the markers worth seeing in an editor."""
+    colors = {kinds.CHAPTER: "BLUE", kinds.MARK: "BLUE", kinds.OFF_SCRIPT: "YELLOW", kinds.FLAG: "RED"}
+    scripted = script is not None and edit is not None
+    markers = [(time, f"{kinds.CHAPTER}: {title}", "BLUE", "") for time, title in section_starts(script, edit)] if scripted else []
     for marker in log.markers:
-        if marker.kind not in colors:
+        if marker.kind not in colors or (scripted and marker.kind == kinds.CHAPTER):
             continue
         time = edit.to_output(marker.start) if edit else marker.start
         if time is not None:
-            markers.append(_marker(f"{marker.kind}: {marker.label}", time, rate, colors[marker.kind]))
+            markers.append((time, f"{marker.kind}: {marker.label}", colors[marker.kind], ""))
     for take in log.takes:
         for flagged in take.flagged:
             when = flagged.get("start") or take.start
             time = edit.to_output(when) if edit else when
             if time is not None:
-                markers.append(_marker(f"pronunciation: {flagged.get('text', '')}", time, rate, "RED", flagged.get("heard", "")))
+                markers.append((time, f"pronunciation: {flagged.get('text', '')}", "RED", flagged.get("heard", "")))
+    return sorted(markers)
+
+
+def otio(log: TakeLog, edit: Edit | None, sources: list, probes: dict | None = None, rate: float = 30.0, name: str = "retake", script=None) -> str:
+    """sources are render.Source entries: each recording's audio, video and place on the timeline;
+    probes maps media paths to their media.MediaInfo."""
+    probes = probes or {}
+    with_video = any(source.video is not None for source in sources)
+    audio_clips, video_clips = [], []
+    for label, source, local, length, _ in _spans(edit, sources):
+        audio_clips.append({
+            "OTIO_SCHEMA": "Clip.1", "metadata": {}, "name": label, "source_range": _range(local, length, rate),
+            "effects": [], "markers": [], "media_reference": _reference(source.audio, source.duration, rate),
+        })
+        if not with_video:
+            continue
+        if source.video is None:
+            video_clips.append({"OTIO_SCHEMA": "Gap.1", "metadata": {}, "name": "", "source_range": _range(0.0, length, rate), "effects": [], "markers": []})
+            continue
+        probe = probes.get(source.video)
+        video_clips.append({
+            "OTIO_SCHEMA": "Clip.1", "metadata": {}, "name": label,
+            "source_range": _range(_video_time(source, local), length, rate), "effects": [], "markers": [],
+            "media_reference": _reference(source.video, (probe.duration if probe else 0.0) or source.duration, rate),
+        })
+    markers = [_marker(marker_name, time, rate, color, comment) for time, marker_name, color, comment in _timeline_markers(log, edit, script)]
     tracks = []
     if video_clips:
         tracks.append({"OTIO_SCHEMA": "Track.1", "metadata": {}, "name": "Video", "kind": "Video", "children": video_clips, "effects": [], "markers": [], "source_range": None})
@@ -238,6 +345,146 @@ def otio(
         },
     }
     return json.dumps(timeline, indent=2, ensure_ascii=False)
+
+
+def _timecode(frames: int, fps: int) -> str:
+    hours, rest = divmod(frames, fps * 3600)
+    minutes, rest = divmod(rest, fps * 60)
+    seconds, frame = divmod(rest, fps)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frame:02d}"
+
+
+def edl(log: TakeLog, edit: Edit | None, sources: list, rate: float = 30.0, name: str = "retake") -> str:
+    """A CMX 3600 edit list. Every event names its file in a FROM CLIP NAME comment, which is how
+    Resolve and Premiere link it to the media; the audio and video recordings are separate files, so
+    each piece is a video event and an audio event."""
+    fps = max(1, round(rate))
+    rows = [f"TITLE: {name}", "FCM: NON-DROP FRAME", ""]
+    event = 0
+    for _, source, local, length, position in _spans(edit, sources):
+        record_in, record_out = round(position * fps), round((position + length) * fps)
+        if record_out <= record_in:
+            continue
+        tracks = [("V", source.video, _video_time(source, local))] if source.video is not None else []
+        tracks.append(("A", source.audio, local))
+        for track, path, start in tracks:
+            event += 1
+            source_in = round(start * fps)
+            source_out = source_in + record_out - record_in
+            rows.append(f"{event:03d}  AX       {track:<5} C        {_timecode(source_in, fps)} {_timecode(source_out, fps)} "
+                        f"{_timecode(record_in, fps)} {_timecode(record_out, fps)}")
+            rows.append(f"* FROM CLIP NAME: {path.name}")
+            rows.append("")
+    return "\n".join(rows)
+
+
+def fcp_xml(log: TakeLog, edit: Edit | None, sources: list, probes: dict | None = None, rate: float = 30.0, name: str = "retake", script=None) -> str:
+    """A Final Cut Pro 7 XML (xmeml) sequence, which Premiere, Resolve, Kdenlive and Shotcut import."""
+    from xml.etree import ElementTree as ET
+
+    probes = probes or {}
+    fps = max(1, round(rate))
+
+    def add(parent, tag: str, text=None, **attributes):
+        element = ET.SubElement(parent, tag, **attributes)
+        if text is not None:
+            element.text = str(text)
+        return element
+
+    def add_rate(parent) -> None:
+        element = add(parent, "rate")
+        add(element, "timebase", fps)
+        add(element, "ntsc", "FALSE")
+
+    files: dict[Path, str] = {}
+
+    def add_file(parent, path: Path, kind: str) -> None:
+        if path in files:
+            add(parent, "file", id=files[path])
+            return
+        files[path] = f"file-{len(files) + 1}"
+        probe = probes.get(path)
+        element = add(parent, "file", id=files[path])
+        add(element, "name", path.name)
+        add(element, "pathurl", "file://localhost" + quote(str(path.resolve())))
+        add_rate(element)
+        add(element, "duration", round((probe.duration if probe else 0.0) * fps))
+        described = add(element, "media")
+        if kind == "video":
+            characteristics = add(add(described, "video"), "samplecharacteristics")
+            add(characteristics, "width", probe.width if probe else 1920)
+            add(characteristics, "height", probe.height if probe else 1080)
+        else:
+            add(add(described, "audio"), "channelcount", (probe.channels if probe else 0) or 1)
+
+    root = ET.Element("xmeml", version="5")
+    sequence = add(root, "sequence", id="sequence-1")
+    add(sequence, "name", name)
+    duration = add(sequence, "duration")
+    add_rate(sequence)
+    described = add(sequence, "media")
+    first_video = next((probes.get(s.video) for s in sources if s.video is not None), None)
+    video_track = None
+    if any(source.video is not None for source in sources):
+        video = add(described, "video")
+        characteristics = add(add(video, "format"), "samplecharacteristics")
+        add_rate(characteristics)
+        add(characteristics, "width", first_video.width if first_video else 1920)
+        add(characteristics, "height", first_video.height if first_video else 1080)
+        video_track = add(video, "track")
+    audio_track = add(add(described, "audio"), "track")
+    count = 0
+    end = 0
+    for label, source, local, length, position in _spans(edit, sources):
+        record_in, record_out = round(position * fps), round((position + length) * fps)
+        if record_out <= record_in:
+            continue
+        end = record_out
+        pieces = [(audio_track, source.audio, local, "audio")]
+        if video_track is not None and source.video is not None:
+            pieces.insert(0, (video_track, source.video, _video_time(source, local), "video"))
+        for track, path, start, kind in pieces:
+            count += 1
+            clip = add(track, "clipitem", id=f"clipitem-{count}")
+            add(clip, "name", label)
+            probe = probes.get(path)
+            add(clip, "duration", round((probe.duration if probe else source.duration) * fps))
+            add_rate(clip)
+            add(clip, "start", record_in)
+            add(clip, "end", record_out)
+            add(clip, "in", round(start * fps))
+            add(clip, "out", round(start * fps) + record_out - record_in)
+            add_file(clip, path, kind)
+            if kind == "audio":
+                track_source = add(clip, "sourcetrack")
+                add(track_source, "mediatype", "audio")
+                add(track_source, "trackindex", 1)
+    duration.text = str(end)
+    for time, marker_name, _, comment in _timeline_markers(log, edit, script):
+        marker = add(sequence, "marker")
+        add(marker, "name", marker_name)
+        add(marker, "comment", comment)
+        add(marker, "in", round(time * fps))
+        add(marker, "out", -1)
+    ET.indent(root)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n' + ET.tostring(root, encoding="unicode") + "\n"
+
+
+TIMELINE_FORMATS = {"otio": "timeline.otio", "edl": "timeline.edl", "fcpxml": "timeline.xml"}
+
+
+def timeline_file(log: TakeLog, edit: Edit | None, sources: list, probes: dict, settings: dict, name: str, script=None) -> tuple[str, str]:
+    """The file name and text for the Timeline export, at the video's frame rate (30 without video)."""
+    fmt = settings["timeline_format"]
+    first_video = next((probes.get(s.video) for s in sources if s.video is not None and probes.get(s.video)), None)
+    rate = float(round(first_video.fps)) if first_video and first_video.fps else 30.0
+    if fmt == "edl":
+        text = edl(log, edit, sources, rate, name)
+    elif fmt == "fcpxml":
+        text = fcp_xml(log, edit, sources, probes, rate, name, script)
+    else:
+        text = otio(log, edit, sources, probes, rate, name, script)
+    return TIMELINE_FORMATS[fmt], text
 
 
 def script_timing(script, log: TakeLog, edit: Edit | None, name: str = "") -> dict:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from platformdirs import user_cache_path, user_config_path, user_data_path, user_log_path, user_videos_path
@@ -22,6 +23,20 @@ def cache_dir() -> Path:
 
 def logs_dir() -> Path:
     return user_log_path(APP, ensure_exists=True)
+
+
+RECORDING_LOGS_KEPT = 40
+
+
+def recording_log(name: str) -> Path:
+    """A diagnostics file for one recording (resource samples, a recorder's output), named after
+    when it started; only the most recent ones are kept."""
+    directory = logs_dir() / "recordings"
+    directory.mkdir(parents=True, exist_ok=True)
+    old = sorted(directory.iterdir())
+    for path in old[:max(0, len(old) - RECORDING_LOGS_KEPT + 1)]:
+        path.unlink(missing_ok=True)
+    return directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{name}"
 
 
 def models_dir() -> Path:

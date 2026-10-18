@@ -14,7 +14,6 @@ from ..script.lexicon import atomic_write
 
 WARN = "warn"
 REQUIRE = "require"
-LOG = "log"
 
 
 @dataclass
@@ -25,7 +24,7 @@ class CoachSettings:
     enabled: bool = True
     threshold: float = 55.0
     require: float | None = None
-    drill: bool = True
+    # Passes in a row a drill wants after a Require failure; 0 sends you back without drilling.
     drill_times: int = 3
     timing: str = "live"
     auto_flag_misses: int = 3
@@ -111,6 +110,10 @@ class PracticeHistory:
 
     def uncoached(self) -> set[str]:
         return {k for k, v in self.words.items() if v.get("uncoached")}
+
+    def clear(self) -> None:
+        """Forgets every score, miss and practice flag; the words you chose not to coach stay."""
+        self.words = {key: {"attempts": 0, "misses": 0, "uncoached": True} for key, entry in self.words.items() if entry.get("uncoached")}
 
     def drill_list(self) -> list[tuple[str, int, int]]:
         rows = [(k, v["misses"], v["attempts"]) for k, v in self.words.items() if v.get("misses")]

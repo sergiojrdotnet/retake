@@ -17,7 +17,6 @@ DEFAULTS = {
     "green": "#46A758",
     "yellow": "#F5D90A",
     "lighter_background": "#1E1E1E",
-    "selection": "#2A2A2A",
 }
 
 
@@ -72,4 +71,3 @@ class Theme(QObject):
     green = _color("green", changed)
     yellow = _color("yellow", changed)
     surface = _color("lighter_background", changed)
-    selection = _color("selection", changed)

@@ -17,7 +17,6 @@ Item {
         RowLayout {
             spacing: 12
             Button { text: qsTr("Import scripts…"); highlighted: true; onClicked: app.importScriptsDialog() }
-            Button { text: qsTr("Free recording"); onClicked: app.newFreeRecording() }
             Button { text: qsTr("Show explorer"); visible: !app.explorerVisible; onClicked: app.toggleExplorer() }
         }
     }

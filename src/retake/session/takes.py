@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
-
-from ..script.lexicon import atomic_write
 
 RECORDING = "recording"
 COMPLETE = "complete"
@@ -15,8 +12,6 @@ TTS = "tts"
 OFF_SCRIPT = "off-script"
 CHAPTER = "chapter"
 MARK = "mark"
-CAMERA = "camera"
-SCENE = "scene"
 PAUSE = "pause"
 ADLIB = "adlib"
 FLAG = "flag"
@@ -48,7 +43,6 @@ class Take:
     score: float | None = None
     flagged: list[dict] = field(default_factory=list)
     deviations: list[dict] = field(default_factory=list)
-    preferred: bool = False
     stale: bool = False
 
     @property
@@ -79,7 +73,10 @@ class Marker:
 
 @dataclass
 class TakeLog:
-    path: Path | None = None
+    """Every take and marker of a recording. A log with a sink hands itself over on each change
+    (to the project's .retake file); one without is kept in memory only."""
+
+    sink: Callable[[dict], None] | None = None
     takes: list[Take] = field(default_factory=list)
     markers: list[Marker] = field(default_factory=list)
     meta: dict = field(default_factory=dict)
@@ -105,22 +102,13 @@ class TakeLog:
     def markers_of(self, *kinds: str) -> list[Marker]:
         return [m for m in self.markers if m.kind in kinds]
 
+    def as_dict(self) -> dict:
+        return {"meta": self.meta, "takes": [t.as_dict() for t in self.takes], "markers": [m.as_dict() for m in self.markers]}
+
     def save(self) -> None:
-        if self.path is None:
-            return
-        payload = {
-            "version": 1,
-            "meta": self.meta,
-            "takes": [t.as_dict() for t in self.takes],
-            "markers": [m.as_dict() for m in self.markers],
-        }
-        atomic_write(self.path, json.dumps(payload, indent=1, ensure_ascii=False))
+        if self.sink is not None:
+            self.sink(self.as_dict())
 
     @classmethod
-    def load(cls, path: Path) -> TakeLog:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        log = cls(path)
-        log.meta = data.get("meta", {})
-        log.takes = [Take.from_dict(t) for t in data.get("takes", [])]
-        log.markers = [Marker(**m) for m in data.get("markers", [])]
-        return log
+    def from_dict(cls, data: dict, sink: Callable[[dict], None] | None = None) -> TakeLog:
+        return cls(sink, [Take.from_dict(t) for t in data.get("takes", [])], [Marker(**m) for m in data.get("markers", [])], data.get("meta", {}))

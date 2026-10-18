@@ -10,6 +10,7 @@ RetakeDialog {
     title: qsTr("New project")
     width: Math.min(parent.width - 60, 600)
     standardButtons: Dialog.Ok | Dialog.Cancel
+
     onOpened: {
         done = false
         name.text = ""

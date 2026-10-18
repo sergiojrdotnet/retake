@@ -7,7 +7,7 @@ from ..languages.packs import LanguagePack
 from . import normalize
 from .lexicon import Lexicon
 from .model import (
-    ADLIB, CAMERA, CUE, PAUSE, SCENE, SPOKEN, TEXT, WORD,
+    ADLIB, CUE, PAUSE, SPOKEN, TEXT, WORD,
     Paragraph, Script, Section, Sentence, Token, Word,
 )
 
@@ -37,6 +37,7 @@ _INLINE = re.compile(
 )
 _TERMINATOR = re.compile(r"[.!?…]+[\"'”’)\]]*$")
 _ADLIB_PLACEHOLDER = "\x00ADLIB{}\x00"
+PLAIN_SUFFIXES = (".txt",)
 _EMPH_ON, _EMPH_OFF = "\x01", "\x02"
 
 
@@ -48,6 +49,8 @@ def parse_file(path: Path, pack: LanguagePack, lexicon: Lexicon | None = None) -
 def parse(text: str, pack: LanguagePack, path: Path | None = None, spoken: dict[str, list[list[str]]] | None = None) -> Script:
     text = text.replace("\r\n", "\n")
     title = path.stem if path else "Untitled"
+    if path is not None and path.suffix.lower() in PLAIN_SUFFIXES:
+        return _parse_plain(text, pack, title, path, spoken or {})
     front = _FRONT_MATTER.match(text)
     if front:
         for line in front.group(1).splitlines():
@@ -84,6 +87,17 @@ def parse(text: str, pack: LanguagePack, path: Path | None = None, spoken: dict[
             builder.add_adlib(adlibs[payload])
         else:
             builder.add_paragraph(payload)
+    return builder.build()
+
+
+def _parse_plain(text: str, pack: LanguagePack, title: str, path: Path, spoken: dict[str, list[list[str]]]) -> Script:
+    """A plain-text script: no markup at all. Blank lines separate paragraphs and every word is
+    read; only the lexicon beside it adds pronunciations and spoken forms."""
+    builder = _Builder(pack, title, path, [], spoken)
+    for block in re.split(r"\n\s*\n", text):
+        paragraph = " ".join(block.split())
+        if paragraph:
+            builder.add_paragraph(paragraph, plain=True)
     return builder.build()
 
 
@@ -136,9 +150,6 @@ def _plain(text: str) -> str:
 
 def _is_cue(content: str) -> bool:
     letters = [c for c in content if c.isalpha()]
-    upper = content.strip().upper()
-    if upper.startswith(("SCENE:", "CAMERA:")):
-        return True
     return bool(letters) and all(c.isupper() for c in letters)
 
 
@@ -200,9 +211,9 @@ class _Builder:
         sentence = self._new_sentence(paragraph, ADLIB)
         sentence.note = _plain(" ".join(note.split()))
 
-    def add_paragraph(self, text: str) -> None:
+    def add_paragraph(self, text: str, plain: bool = False) -> None:
         paragraph = self._new_paragraph()
-        tokens = self._tokenize(text)
+        tokens = [self._word(word, False) for word in text.split()] if plain else self._tokenize(text)
         sentence = self._new_sentence(paragraph)
         for token in tokens:
             if token.kind == "anchor":
@@ -296,11 +307,6 @@ class _Builder:
 
     @staticmethod
     def _cue(content: str) -> Token:
-        upper = content.upper()
-        if upper.startswith("SCENE:"):
-            return Token(SCENE, content, value=content.split(":", 1)[1].strip())
-        if upper.startswith("CAMERA:"):
-            return Token(CAMERA, content, value=content.split(":", 1)[1].strip().lower())
         return Token(CUE, content)
 
     def build(self) -> Script:

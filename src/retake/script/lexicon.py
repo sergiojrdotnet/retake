@@ -78,10 +78,6 @@ class Lexicon:
             del self.entries[key]
         self.save()
 
-    def set_ipa(self, key: str, ipa: str) -> None:
-        self.entries.setdefault(key, Entry()).ipa = ipa
-        self.save()
-
     def save(self) -> None:
         if self.path is None:
             return

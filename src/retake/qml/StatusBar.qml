@@ -11,7 +11,7 @@ Rectangle {
 
     property var r: app.resources
     property string place: app.page === "editor" ? app.itemTitle
-                         : app.page === "session" ? (app.hasScript ? app.scriptTitle : qsTr("Free session")) : ""
+                         : app.page === "session" ? app.scriptTitle : ""
     // On one line the switch sits in the middle, so each side gets half of what's left around it.
     property real sideWidth: Math.max(whereAmI.implicitWidth, engines.implicitWidth + metersWide.implicitWidth + help.implicitWidth + 2 * 14)
     property real oneLineWidth: 2 * sideWidth + switcherWide.implicitWidth + 2 * 24 + 22
@@ -33,45 +33,75 @@ Rectangle {
         return percent >= 92 ? "#f85149" : percent >= 75 ? "#e3b341" : theme.accent
     }
 
+    // A pill of options with the current one filled in.
+    component Segmented: Rectangle {
+        id: pill
+        property var options: []
+        property string current: ""
+        property bool locked: false
+        property string lockedTip: ""
+        signal picked(string value)
+        implicitWidth: row.implicitWidth + 6
+        implicitHeight: 28
+        radius: 14
+        color: Qt.lighter(theme.surface, 1.35)
+        opacity: locked ? 0.5 : 1
+        Row {
+            id: row
+            anchors.centerIn: parent
+            spacing: 2
+            Repeater {
+                model: pill.options
+                delegate: Rectangle {
+                    required property var modelData
+                    property bool active: pill.current === modelData.value
+                    width: label.implicitWidth + 26
+                    height: 22
+                    radius: 11
+                    color: active ? theme.accent : hover.hovered && !pill.locked ? Qt.lighter(theme.surface, 1.7) : "transparent"
+                    Label {
+                        id: label
+                        anchors.centerIn: parent
+                        text: modelData.text
+                        font.pixelSize: 13
+                        font.bold: parent.active
+                        color: parent.active ? theme.background : theme.foreground
+                    }
+                    HoverHandler { id: hover; cursorShape: parent.active || pill.locked ? Qt.ArrowCursor : Qt.PointingHandCursor }
+                    TapHandler { enabled: !parent.active && !pill.locked; onTapped: pill.picked(modelData.value) }
+                    ToolTip.visible: hover.hovered
+                    ToolTip.text: pill.locked ? pill.lockedTip : modelData.tip
+                }
+            }
+        }
+    }
+
     Component {
         id: switcherComponent
         RowLayout {
-            spacing: 12
-            Rectangle {
+            spacing: 10
+            // How the recording page is laid out; only there.
+            Segmented {
+                visible: app.page === "session"
+                current: app.layout
+                options: [
+                    { value: "full", text: qsTr("Full"), tip: qsTr("1 · prompter with camera, coach and takes") },
+                    { value: "focus", text: qsTr("Focus"), tip: qsTr("2 · only the prompter") },
+                    { value: "lens", text: qsTr("Lens"), tip: qsTr("3 · one sentence at a time, for a window under the camera") },
+                ]
+                onPicked: (value) => app.setLayout(value)
+            }
+            // Record and Studio for the open script, always one click (or Ctrl+Tab) apart.
+            Segmented {
                 visible: app.hasProject && (app.page === "session" || app.page === "editor")
-                implicitWidth: segments.implicitWidth + 6
-                implicitHeight: 28
-                radius: 14
-                color: Qt.lighter(theme.surface, 1.35)
-                opacity: app.recording ? 0.5 : 1
-                Row {
-                    id: segments
-                    anchors.centerIn: parent
-                    spacing: 2
-                    Repeater {
-                        model: [["record", "●  " + qsTr("Record"), "session"], ["studio", "✎  " + qsTr("Studio"), "editor"]]
-                        delegate: Rectangle {
-                            required property var modelData
-                            property bool active: app.page === modelData[2]
-                            width: segmentLabel.implicitWidth + 26
-                            height: 22
-                            radius: 11
-                            color: active ? theme.accent : segmentHover.hovered && !app.recording ? Qt.lighter(theme.surface, 1.7) : "transparent"
-                            Label {
-                                id: segmentLabel
-                                anchors.centerIn: parent
-                                text: modelData[1]
-                                font.pixelSize: 13
-                                font.bold: parent.active
-                                color: parent.active ? theme.background : theme.foreground
-                            }
-                            HoverHandler { id: segmentHover; cursorShape: parent.active || app.recording ? Qt.ArrowCursor : Qt.PointingHandCursor }
-                            TapHandler { enabled: !parent.active && !app.recording; onTapped: app.showView(modelData[0]) }
-                            ToolTip.visible: segmentHover.hovered
-                            ToolTip.text: app.recording ? qsTr("Stop the recording first (Enter)") : qsTr("Ctrl+Tab switches between Record and Studio")
-                        }
-                    }
-                }
+                current: app.page === "editor" ? "studio" : "record"
+                locked: app.recording
+                lockedTip: qsTr("Stop the recording first (Enter)")
+                options: [
+                    { value: "record", text: "●  " + qsTr("Record"), tip: qsTr("Ctrl+Tab switches between Record and Studio") },
+                    { value: "studio", text: "✎  " + qsTr("Studio"), tip: qsTr("Ctrl+Tab switches between Record and Studio") },
+                ]
+                onPicked: (value) => app.showView(value)
             }
         }
     }

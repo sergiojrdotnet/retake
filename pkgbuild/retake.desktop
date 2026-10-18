@@ -7,6 +7,6 @@ Exec=retake %f
 Icon=retake
 Terminal=false
 Categories=AudioVideo;Recorder;Video;
-MimeType=application/x-retake-project;text/markdown;
+MimeType=application/x-retake-project;
 Keywords=teleprompter;prompter;recorder;voice;pronunciation;retake;
 StartupWMClass=retake

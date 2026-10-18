@@ -40,7 +40,6 @@ class Snapshot:
     ram_used_mb: float
     ram_total_mb: float
     ram_available_mb: float
-    swap_used_mb: float
     disk_free_gb: float
     disk_write_mbps: float
     gpu: GpuStats
@@ -177,7 +176,6 @@ class ResourceMonitor:
 
     def sample(self) -> Snapshot:
         memory = psutil.virtual_memory()
-        swap = psutil.swap_memory()
         try:
             usage = shutil.disk_usage(self.disk_path if self.disk_path.exists() else Path.home())
             free_gb = usage.free / 2**30
@@ -220,7 +218,6 @@ class ResourceMonitor:
             ram_used_mb=(memory.total - memory.available) / 2**20,
             ram_total_mb=memory.total / 2**20,
             ram_available_mb=memory.available / 2**20,
-            swap_used_mb=swap.used / 2**20,
             disk_free_gb=free_gb,
             disk_write_mbps=write_rate,
             gpu=gpu,

@@ -19,11 +19,8 @@ optdepends=(
   'python-faster-whisper: more accurate voice following with Whisper (AUR)'
   'piper-tts-bin: natural reference voice (AUR)'
   'scrcpy: Android phone as camera'
-  'gpu-screen-recorder: screen + camera recording'
   'python-nvidia-ml-py: NVIDIA GPU monitoring'
-  'python-websockets: OBS control'
   'python-evdev: exclusive foot pedal input'
-  'hyprland: camera window placement'
 )
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel' 'qt6-tools')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")

@@ -12,15 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULTS = {
-    "phone_camera": "back",
-    "phone_size": "3840x2160",
-    "phone_fps": 30,
-    "phone_codec": "h265",
-    "phone_bitrate": "40M",
-    "phone_shape": "landscape",
-    "phone_flip": False,
-    "phone_preview": False,
-    "phone_serial": "",
+    "camera": "back",
+    "size": "3840x2160",
+    "fps": 30,
+    "codec": "h265",
+    "bitrate": "40M",
+    "container": "mkv",
+    "shape": "landscape",
+    "flip": False,
+    "preview": False,
+    "serial": "",
 }
 
 LOOPBACK_LABEL = "Retake phone"
@@ -188,31 +189,31 @@ def find_camera(cameras: list[Camera], choice: str) -> Camera | None:
 def resolve(settings: dict, cameras: list[Camera]) -> tuple[dict, str]:
     """Fits the saved settings to what the phone's camera supports; returns them and a note when changed."""
     options = {**DEFAULTS, **{k: v for k, v in settings.items() if k in DEFAULTS and v not in (None, "")}}
-    camera = find_camera(cameras, str(options["phone_camera"]))
+    camera = find_camera(cameras, str(options["camera"]))
     if camera is None:
         return options, ""
     notes = []
-    fps = int(options["phone_fps"])
-    size = options["phone_size"] or max(camera.sizes, key=_pixels, default=camera.size)
+    fps = int(options["fps"])
+    size = options["size"] or max(camera.sizes, key=_pixels, default=camera.size)
     high = [(s, f) for s, f in camera.high_speed if fps in f]
     if fps not in camera.fps and high:
         fitting = [s for s, _ in high if _pixels(s) <= _pixels(size)] or [s for s, _ in high]
-        options["phone_size"] = max(fitting, key=_pixels)
-        options["phone_high_speed"] = True
-        if options["phone_size"] != size:
-            notes.append(f"{fps} fps is a high-speed mode, recorded at {options['phone_size'].replace('x', '×')}")
+        options["size"] = max(fitting, key=_pixels)
+        options["high_speed"] = True
+        if options["size"] != size:
+            notes.append(f"{fps} fps is a high-speed mode, recorded at {options['size'].replace('x', '×')}")
     elif fps not in camera.fps:
         best = max((f for f in camera.fps if f <= fps), default=max(camera.fps, default=30))
         notes.append(f"this camera doesn't do {fps} fps; recording at {best}")
-        options["phone_fps"] = best
-    if not options.get("phone_high_speed") and camera.sizes and size not in camera.sizes:
+        options["fps"] = best
+    if not options.get("high_speed") and camera.sizes and size not in camera.sizes:
         smaller = [s for s in camera.sizes if _pixels(s) <= _pixels(size)] or camera.sizes
         same_shape = [s for s in smaller if _ratio(s) == _ratio(size)]
         fallback = max(same_shape or smaller, key=_pixels)
         notes.append(f"this camera has no {size.replace('x', '×')}; recording at {fallback.replace('x', '×')}")
-        options["phone_size"] = fallback
-    options["phone_camera"] = camera.id
-    options["phone_facing"] = camera.facing
+        options["size"] = fallback
+    options["camera"] = camera.id
+    options["facing"] = camera.facing
     return options, "; ".join(notes)
 
 
@@ -220,15 +221,15 @@ def capture_rotation(options: dict) -> int:
     """scrcpy delivers the camera upright for a phone held sideways. Held upright, the picture
     has to turn a quarter: clockwise for the back camera, the other way for the front one."""
     rotation = 0
-    if options.get("phone_shape") == "portrait":
-        rotation = 270 if options.get("phone_facing", options.get("phone_camera")) == "front" else 90
-    if options.get("phone_flip"):
+    if options.get("shape") == "portrait":
+        rotation = 270 if options.get("facing", options.get("camera")) == "front" else 90
+    if options.get("flip"):
         rotation += 180
     return rotation % 360
 
 
 def portrait(settings: dict) -> bool:
-    return settings.get("phone_shape", DEFAULTS["phone_shape"]) == "portrait"
+    return settings.get("shape", DEFAULTS["shape"]) == "portrait"
 
 
 def aspect(size: str) -> str:
@@ -245,21 +246,21 @@ def command(output: Path | None, settings: dict, sink: str | None = None) -> lis
 
     Without output it's a preview: a smaller picture and no audio, only for the camera panel."""
     options = {**DEFAULTS, **{k: v for k, v in settings.items() if k in DEFAULTS and v not in (None, "")}}
-    options.update({k: settings[k] for k in ("phone_high_speed", "phone_facing") if k in settings})
-    camera = str(options["phone_camera"])
+    options.update({k: settings[k] for k in ("high_speed", "facing") if k in settings})
+    camera = str(options["camera"])
     args = ["scrcpy", "--video-source=camera", "--no-control"]
     args.append(f"--camera-id={camera}" if camera.isdigit() else f"--camera-facing={camera}")
     if output is None:
-        args += ["--max-size=1280", "--no-audio", f"--camera-ar={aspect(options['phone_size'])}"]
-    elif options["phone_size"]:
-        args.append(f"--camera-size={options['phone_size']}")
-    if output is not None and options.get("phone_high_speed"):
+        args += ["--max-size=1280", "--no-audio", f"--camera-ar={aspect(options['size'])}"]
+    elif options["size"]:
+        args.append(f"--camera-size={options['size']}")
+    if output is not None and options.get("high_speed"):
         args.append("--camera-high-speed")
-    preview_fps = min(int(options["phone_fps"]), 30) if output is None and options.get("phone_high_speed") else int(options["phone_fps"])
-    args += [f"--camera-fps={preview_fps}", f"--video-codec={options['phone_codec']}"]
+    preview_fps = min(int(options["fps"]), 30) if output is None and options.get("high_speed") else int(options["fps"])
+    args += [f"--camera-fps={preview_fps}", f"--video-codec={options['codec']}"]
     if output is not None:
         args += [
-            f"--record={output}", "--record-format=mkv", f"--video-bit-rate={options['phone_bitrate']}",
+            f"--record={output}", f"--record-format={output.suffix.lstrip('.')}", f"--video-bit-rate={options['bitrate']}",
             # A keyframe every second lets the waiting and pauses be cut out later without re-encoding.
             "--video-codec-options=i-frame-interval:int=1",
             # The phone microphone is recorded only to line the video up with Retake's own audio, and
@@ -271,12 +272,12 @@ def command(output: Path | None, settings: dict, sink: str | None = None) -> lis
         args.append(f"--capture-orientation={rotation}")
     if sink:
         args += [f"--v4l2-sink={sink}", "--no-window"]
-    elif output is not None and options["phone_preview"]:
+    elif output is not None and options["preview"]:
         args += ["--window-title=Retake phone camera", "--window-width=480", "--window-height=270"]
     else:
         args.append("--no-window")
-    if options["phone_serial"]:
-        args.append(f"--serial={options['phone_serial']}")
+    if options["serial"]:
+        args.append(f"--serial={options['serial']}")
     return args
 
 
@@ -323,7 +324,10 @@ class PhoneRecorder:
                 if "Recording started" in text or (self.output is None and "v4l2" in text.lower() and "ERROR" not in text):
                     self.started = time.monotonic()
                     self._ready.set()
-                elif text.startswith("ERROR"):
+                elif "number of open cameras" in text or "Camera device in use" in text or "CAMERA_IN_USE" in text:
+                    # Android lets one app use the camera; scrcpy's own errors that follow ("Demuxer error") say less.
+                    self.error = "the phone's camera is in use by another app; close the Camera app on the phone"
+                elif text.startswith("ERROR") and not self.error.startswith("the phone's camera"):
                     self.error = text.removeprefix("ERROR:").strip()
         self._ready.set()
 

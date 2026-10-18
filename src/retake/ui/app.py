@@ -49,7 +49,7 @@ def _quiet_ffmpeg() -> None:
             pass
 
 
-def run(path: str | None = None, free: bool = False) -> int:
+def run(path: str | None = None) -> int:
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Material")
     from PySide6.QtCore import QLoggingCategory, QTimer, QTranslator
     from PySide6.QtGui import QGuiApplication, QIcon
@@ -98,14 +98,8 @@ def run(path: str | None = None, free: bool = False) -> int:
         controller.shutdown()
         return 1
     controller.attach_window(engine.rootObjects()[0])
-    if free:
-        controller.startFree()
-    elif path:
-        target = Path(path).expanduser()
-        if target.is_dir() or target.suffix == ".retake":
-            controller.openProject(str(target))
-        else:
-            controller.openScript(str(target))
+    if path:
+        controller.openProject(str(Path(path).expanduser()))
     app.aboutToQuit.connect(controller.shutdown)
 
     def stop(*_):

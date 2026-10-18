@@ -3,7 +3,7 @@ import json
 
 from retake.edit import exports
 from retake.edit.autoedit import Rules, auto_edit
-from retake.edit.edl import Edit, History
+from retake.edit.edl import Clip, Edit, History
 from retake.session import takes as kinds
 from retake.session.takes import COMPLETE, REJECTED, TakeLog, WordTiming
 
@@ -60,18 +60,16 @@ def test_edit_operations_and_undo():
 def test_time_mapping_round_trip():
     edit = auto_edit(sample_log(), 20.0, Rules())
     out = edit.to_output(6.5)
-    assert out is not None and abs(edit.to_source(out) - 6.5) < 1e-6
+    assert out is not None and abs(out - (6.5 - edit.clips[1].start + edit.clips[0].duration)) < 1e-6
     assert edit.to_output(10.0) is None
 
 
 def test_script_order():
-    edit = Edit(source_duration=30, order="script")
-    edit.clips = []
+    edit = Edit(source_duration=30)
     edit.add(10, 12, sentence=0, take=5)
-    edit.order = "source"
     edit.add(1, 3, sentence=1, take=2)
-    edit.order = "script"
-    assert [c.sentence for c in edit.timeline()] == [0, 1]
+    edit.add(4, 5, take=3)
+    assert [c.sentence for c in edit.timeline()] == [0, 1, None]
 
 
 def test_exports(tmp_path):
@@ -92,6 +90,118 @@ def test_exports(tmp_path):
     assert len(clips) == 3 and clips[0]["media_reference"]["target_url"].startswith("file://")
     meta = exports.ffmetadata([(0.0, "Intro"), (5.0, "Next")], 9.0)
     assert "START=5000" in meta and "END=9000" in meta
+
+
+def test_caption_layout_follows_line_settings():
+    words = [(i * 0.4, i * 0.4 + 0.3, w) for i, w in enumerate("this sentence is long enough to need a few short captions here.".split())]
+    for _, _, group in exports.cues(words, line=20, lines=1):
+        assert len(" ".join(w[2] for w in group)) <= 20
+    assert all(len(row) <= 42 for row in exports.srt(words).splitlines())
+    burned = exports.ass(words, 1080, 1920, line=20, lines=2)
+    assert "PlayResX: 1080" in burned and "PlayResY: 1920" in burned and "Dialogue: 0,0:00:00.00," in burned
+    assert exports.transcript(words + [(9.0, 9.4, "Next."), (9.5, 9.9, "Done.")]).splitlines()[-2:] == ["Next.", "Done."]
+    name, text = exports.captions_file(words, {"captions_format": "vtt-words", "caption_line": 32, "caption_lines": 2})
+    assert name == "captions-words.vtt" and "<00:00:00.400>sentence" in text
+
+
+def test_edl_and_fcp_xml_place_video_and_audio_events(tmp_path):
+    from xml.etree import ElementTree
+
+    from retake.edit.media import MediaInfo
+    from retake.edit.render import Source
+
+    log = sample_log()
+    edit = auto_edit(log, 20.0, Rules())
+    video, audio = tmp_path / "part-001.mkv", tmp_path / "part-001.flac"
+    sources = [Source(audio, 0.0, 20.0, video, 0.5)]
+    probes = {video: MediaInfo(19.5, True, True, 1080, 1920, 30.0), audio: MediaInfo(20.0, False, True, sample_rate=48000, channels=1)}
+    name, text = exports.timeline_file(log, edit, sources, probes, {"timeline_format": "edl"}, "ep1")
+    events = [row for row in text.splitlines() if row[:3].isdigit()]
+    assert name == "timeline.edl" and len(events) == 6
+    assert events[0].split()[2] == "V" and events[1].split()[2] == "A"
+    assert events[0].split()[-2] == "00:00:00:00" and "* FROM CLIP NAME: part-001.mkv" in text
+    name, text = exports.timeline_file(log, edit, sources, probes, {"timeline_format": "fcpxml"}, "ep1")
+    root = ElementTree.fromstring(text.split("\n", 2)[2])
+    assert name == "timeline.xml" and len(root.findall(".//clipitem")) == 6
+    assert len(root.findall(".//file/pathurl")) == 2
+    assert root.find(".//sequence/media/video/format/samplecharacteristics/height").text == "1920"
+    assert root.find(".//sequence/marker/name").text == "chapter: Intro"
+
+
+def test_export_names_and_sizes():
+    from retake.edit.render import audio_output_name, scaled, video_output_name
+
+    assert video_output_name({"video_format": "mp4-h264", "video_size": 0}) == "video.mp4"
+    assert video_output_name({"video_format": "mp4-hevc", "video_size": 720}) == "video-hevc-720p.mp4"
+    assert video_output_name({"video_format": "mov-prores", "video_size": 0}) == "video.mov"
+    assert audio_output_name({"audio_format": "alac"}) == "narration-alac.m4a"
+    assert audio_output_name({"audio_format": "vorbis"}) == "narration.ogg"
+    assert scaled(3840, 2160, 1080) == (1920, 1080)
+    assert scaled(1080, 1920, 720) == (720, 1280)
+    assert scaled(1280, 720, 1080) == (1280, 720)
+    assert scaled(1366, 768, 480) == (854, 480)
+
+
+def test_audio_export_keeps_the_rate_through_loudness(tmp_path):
+    import soundfile as sf
+    import numpy as np
+
+    from retake.edit import media
+    from retake.edit.render import RenderJob, Source, render
+
+    rate = 48000
+    tone = (0.05 * np.sin(np.arange(rate * 3) * 2 * np.pi * 220 / rate)).astype(np.float32)
+    sf.write(tmp_path / "part-001.flac", tone, rate, subtype="PCM_24")
+    edit = Edit(source_duration=3.0, crossfade_ms=0)
+    edit.add(0.0, 3.0, sentence=0)
+    sources = [Source(tmp_path / "part-001.flac", 0.0, 3.0)]
+    render(RenderJob(edit, sources, tmp_path / "n.flac", loudness=-16.0, chapters=[(0.0, "Intro")]))
+    assert media.probe(tmp_path / "n.flac").sample_rate == 48000
+    render(RenderJob(edit, sources, tmp_path / "n.mp3", audio="mp3", audio_bitrate="128k", sample_rate=44100, channels=2))
+    info = media.probe(tmp_path / "n.mp3")
+    assert (info.sample_rate, info.channels) == (44100, 2)
+
+
+def test_video_export_scales_retimes_and_burns_captions(tmp_path):
+    import subprocess
+
+    import soundfile as sf
+    import numpy as np
+
+    from retake.edit import media
+    from retake.edit.render import RenderJob, Source, render
+
+    rate = 48000
+    sf.write(tmp_path / "part-001.flac", np.full(rate * 3, 0.05, dtype=np.float32), rate, subtype="PCM_24")
+    video = tmp_path / "part-001.mkv"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=3", "-c:v", "libx264", str(video)], check=True)
+    edit = Edit(source_duration=3.0, crossfade_ms=0)
+    edit.add(0.5, 2.5, sentence=0)
+    job = RenderJob(edit, [Source(tmp_path / "part-001.flac", 0.0, 3.0, video)], tmp_path / "out.mov", video="prores", audio="pcm",
+                    size=90, fps=15, captions=[(0.0, 1.0, "Hello"), (1.0, 1.9, "there.")])
+    render(job)
+    info = media.probe(tmp_path / "out.mov")
+    assert (info.width, info.height, round(info.fps)) == (160, 90, 15)
+    assert abs(info.duration - 2.0) < 0.1
+
+
+def test_chapters_follow_the_script_sections_not_the_recording_markers():
+    from retake.languages import packs
+    from retake.script.parser import parse
+
+    script = parse("# Ep\n\n## Intro\n\nOne two. Three four.\n\n## Middle\n\nFive six.", packs.get("en"))
+    log = TakeLog()
+    for sentence, start in [(0, 1.0), (1, 4.0), (2, 7.0)]:
+        take = log.new_take(sentence, start, script.sentences[sentence].text)
+        take.end, take.status = start + 2.0, COMPLETE
+    log.add_marker(kinds.CHAPTER, 1.0, 1.0, "Intro")
+    log.add_marker(kinds.CHAPTER, 7.0, 7.0, "Middle")
+    pickup = log.new_take(0, 12.0, script.sentences[0].text)
+    pickup.end, pickup.status = 14.0, COMPLETE
+    log.add_marker(kinds.CHAPTER, 12.0, 12.0, "Intro")
+    log.add_marker(kinds.MARK, 8.0, 8.0, "Demo")
+    edit = auto_edit(log, 15.0, Rules(handle_before=0, handle_after=0), boundaries=[10.0])
+    assert exports.chapters(log, edit, script) == [(0.0, "Intro"), (4.0, "Middle"), (5.0, "Demo")]
 
 
 def test_script_timing_carries_ids_and_beats():
@@ -133,14 +243,16 @@ def test_stage_directions_tables_symbols_and_spoken_forms():
     assert script.sentences[-1].words[-1].display == "(really)."
 
 
-def test_video_cuts_follow_the_output_frame_grid():
-    from retake.edit.render import frame_aligned
+def test_video_cuts_follow_the_output_frame_grid(tmp_path):
+    from retake.edit.render import RenderJob, Source, pieces
 
-    segments = [(i * 7.0, i * 7.0 + 5.23) for i in range(228)]
-    aligned = frame_aligned(segments, 30.0)
-    assert all(abs((end - start) * 30 - round((end - start) * 30)) < 1e-6 for start, end in aligned)
-    assert abs(sum(end - start for start, end in aligned) - 228 * 5.23) < 1 / 60
-    assert all(a[0] == s[0] for a, s in zip(aligned, segments))
+    edit = Edit(source_duration=1600.0, crossfade_ms=0)
+    edit.clips = [Clip(i + 1, i * 7.0, i * 7.0 + 5.23) for i in range(228)]
+    job = RenderJob(edit, [Source(tmp_path / "a.flac", 0.0, 1600.0, tmp_path / "a.mkv")], tmp_path / "out.mp4", video="h264")
+    planned = pieces(job, 30.0)
+    assert all(abs(p.duration * 30 - round(p.duration * 30)) < 1e-6 for p in planned)
+    assert abs(sum(p.duration for p in planned) - 228 * 5.23) < 1 / 60
+    assert all(abs(p.local - i * 7.0) < 1e-9 for i, p in enumerate(planned))
 
 
 def test_render_reads_each_piece_from_its_own_recording(tmp_path):
@@ -154,7 +266,7 @@ def test_render_reads_each_piece_from_its_own_recording(tmp_path):
     sf.write(tmp_path / "part-001.flac", np.full(rate * 2, 0.1, dtype=np.float32), rate, subtype="PCM_24")
     sf.write(tmp_path / "part-002.flac", np.full(rate * 1, -0.1, dtype=np.float32), rate, subtype="PCM_24")
     sources = [Source(tmp_path / "part-001.flac", 0.0, 2.0), Source(tmp_path / "part-002.flac", 2.0, 1.0)]
-    edit = Edit(source_duration=3.0, order="script", crossfade_ms=0)
+    edit = Edit(source_duration=3.0, crossfade_ms=0)
     edit.add(0.5, 1.0, sentence=0)
     edit.add(1.5, 2.5, sentence=1)
     edit.add(2.6, 2.9, sentence=2)
@@ -173,16 +285,69 @@ def test_pickups_replace_only_their_sentences_and_keep_hand_edits():
     for sentence, start in [(0, 1.0), (1, 4.0), (2, 7.0)]:
         take = log.new_take(sentence, start, f"s{sentence}")
         take.end, take.status = start + 2.0, COMPLETE
-    edit = auto_edit(log, 10.0, Rules(order="script"), boundaries=[])
+    edit = auto_edit(log, 10.0, Rules(), boundaries=[])
     edit.split(8.0)
     pickup = log.new_take(1, 12.0, "s1")
     pickup.end, pickup.status = 13.5, COMPLETE
     edit.source_duration = 14.0
-    assert update_sentences(edit, log, {1}, Rules(order="script"), 14.0, boundaries=[10.0]) == [1]
+    assert update_sentences(edit, log, {1}, Rules(), 14.0, boundaries=[10.0]) == [1]
     sentence_one = [c for c in edit.clips if c.sentence == 1]
     assert len(sentence_one) == 1 and sentence_one[0].start >= 10.0 and sentence_one[0].take == pickup.id
     assert len([c for c in edit.clips if c.sentence == 2]) == 2
     assert [c.sentence for c in edit.timeline()] == [0, 1, 2, 2]
+
+
+def _two_take_log():
+    log = TakeLog()
+    first = log.new_take(0, 1.0, "s0"); first.end, first.status = 3.0, COMPLETE
+    rejected = log.new_take(0, 4.0, "s0"); rejected.end, rejected.status = 5.5, REJECTED
+    second = log.new_take(0, 6.0, "s0"); second.end, second.status = 8.0, COMPLETE
+    other = log.new_take(1, 9.0, "s1"); other.end, other.status = 11.0, COMPLETE
+    return log, first, rejected, second
+
+
+def test_takes_switch_with_their_own_trims():
+    from retake.edit.autoedit import take_choices, use_take
+
+    log, first, rejected, second = _two_take_log()
+    rules = Rules()
+    edit = auto_edit(log, 12.0, rules)
+    assert [c.take for c in edit.timeline()] == [second.id, 4]
+    assert [t.id for t in take_choices(log, 0)] == [second.id, first.id, rejected.id]
+    edit.set_edge(next(c.id for c in edit.clips if c.take == second.id), "start", 6.5)
+    assert use_take(edit, log, first, rules, 12.0)
+    assert [c.take for c in edit.clips if c.sentence == 0] == [first.id]
+    assert edit.alternates[str(second.id)][0]["start"] == 6.5
+    assert use_take(edit, log, second, rules, 12.0)
+    assert [(c.take, c.start) for c in edit.clips if c.sentence == 0] == [(second.id, 6.5)]
+    assert not use_take(edit, log, second, rules, 12.0)
+    assert use_take(edit, log, rejected, rules, 12.0)
+    assert Edit.from_dict(edit.as_dict()).alternates == edit.alternates
+
+
+def test_a_new_take_wins_over_an_earlier_pick():
+    from retake.edit.autoedit import update_sentences, use_take
+
+    log, first, _, second = _two_take_log()
+    rules = Rules()
+    edit = auto_edit(log, 12.0, rules)
+    use_take(edit, log, first, rules, 12.0)
+    newest = log.new_take(0, 13.0, "s0")
+    newest.end, newest.status = 14.5, COMPLETE
+    assert update_sentences(edit, log, {0, 1}, rules, 15.0, boundaries=[12.0]) == [0]
+    assert [c.take for c in edit.timeline()] == [newest.id, 4]
+    assert update_sentences(edit, log, {0}, rules, 15.0, boundaries=[12.0]) == []
+
+
+def test_take_blocks_show_each_take_whole():
+    from retake.edit.autoedit import take_blocks
+
+    log, first, _, second = _two_take_log()
+    log.add_marker(kinds.COMMAND, 7.0, 7.3, "again")
+    rules = Rules(handle_before=0.1, handle_after=0.2)
+    edit = auto_edit(log, 12.0, rules)
+    blocks = take_blocks(edit, log, rules, 12.0)
+    assert [(round(a, 2), round(b, 2), len(clips), take.id) for a, b, clips, take in blocks] == [(5.0, 9.0, 2, second.id), (8.0, 12.0, 1, 4)]
 
 
 def test_auto_edit_handles_stop_at_part_boundaries():
@@ -218,14 +383,14 @@ def test_phone_recorder_starts_and_stops_scrcpy(tmp_path, monkeypatch):
     )
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", f"{fake.parent}{os.pathsep}{os.environ['PATH']}")
-    args = phone.command(tmp_path / "part-001.mkv", {"phone_camera": "front", "phone_size": "3840x2160", "phone_preview": False, "phone_shape": "portrait"})
+    args = phone.command(tmp_path / "part-001.mkv", {"camera": "front", "size": "3840x2160", "preview": False, "shape": "portrait"})
     assert "--camera-facing=front" in args and "--camera-size=3840x2160" in args and "--no-window" in args
     assert "--capture-orientation=270" in args and "--audio-source=mic" in args and "--video-codec=h265" in args
-    assert phone.capture_rotation({"phone_shape": "portrait", "phone_camera": "back"}) == 90
-    assert phone.capture_rotation({"phone_shape": "landscape", "phone_flip": True}) == 180
+    assert phone.capture_rotation({"shape": "portrait", "camera": "back"}) == 90
+    assert phone.capture_rotation({"shape": "landscape", "flip": True}) == 180
     assert not any(a.startswith("--capture-orientation") for a in phone.command(tmp_path / "x.mkv", {}))
-    assert "--camera-id=2" in phone.command(tmp_path / "x.mkv", {"phone_camera": "2"})
-    recorder = phone.PhoneRecorder(tmp_path / "part-001.mkv", {"phone_preview": False}, tmp_path / "scrcpy.log")
+    assert "--camera-id=2" in phone.command(tmp_path / "x.mkv", {"camera": "2"})
+    recorder = phone.PhoneRecorder(tmp_path / "part-001.mkv", {"preview": False}, tmp_path / "scrcpy.log")
     recorder.start(timeout=10)
     assert recorder.started is not None
     assert recorder.stop() == tmp_path / "part-001.mkv"
@@ -253,12 +418,12 @@ def test_phone_recorder_reports_scrcpy_errors(tmp_path, monkeypatch):
 def test_phone_preview_feeds_the_virtual_camera_without_recording(tmp_path):
     from retake.video import phone
 
-    preview = phone.command(None, {"phone_size": "3840x2160"}, "/dev/video42")
+    preview = phone.command(None, {"size": "3840x2160"}, "/dev/video42")
     assert "--v4l2-sink=/dev/video42" in preview and "--no-audio" in preview and "--max-size=1280" in preview
     assert not any(a.startswith("--record") or a.startswith("--camera-size") for a in preview)
     both = phone.command(tmp_path / "part-001.mkv", {}, "/dev/video42")
     assert "--v4l2-sink=/dev/video42" in both and any(a.startswith("--record=") for a in both) and "--no-window" in both
-    for settings, sink in [({}, "/dev/video42"), ({"phone_preview": True}, None), ({"phone_preview": False}, None)]:
+    for settings, sink in [({}, "/dev/video42"), ({"preview": True}, None), ({"preview": False}, None)]:
         assert "--no-audio-playback" in phone.command(tmp_path / "part.mkv", settings, sink)
 
 
@@ -275,13 +440,13 @@ def test_phone_cameras_are_read_from_scrcpy_and_settings_fit_them():
     )
     cameras = phone.parse_cameras(sample)
     assert [(c.id, c.facing, max(c.fps)) for c in cameras] == [("0", "back", 30), ("1", "front", 30)]
-    options, note = phone.resolve({"phone_camera": "back", "phone_fps": 60}, cameras)
-    assert options["phone_fps"] == 30 and "60" in note
-    options, note = phone.resolve({"phone_camera": "0", "phone_fps": 120, "phone_size": "3840x2160"}, cameras)
-    assert options["phone_high_speed"] and options["phone_size"] == "1920x1080"
+    options, note = phone.resolve({"camera": "back", "fps": 60}, cameras)
+    assert options["fps"] == 30 and "60" in note
+    options, note = phone.resolve({"camera": "0", "fps": 120, "size": "3840x2160"}, cameras)
+    assert options["high_speed"] and options["size"] == "1920x1080"
     assert "--camera-high-speed" in phone.command(Path("x.mkv"), options)
-    options, _ = phone.resolve({"phone_camera": "front", "phone_size": "3840x2160", "phone_shape": "portrait"}, cameras)
-    assert options["phone_size"] == "1920x1080" and phone.capture_rotation(options) == 270
+    options, _ = phone.resolve({"camera": "front", "size": "3840x2160", "shape": "portrait"}, cameras)
+    assert options["size"] == "1920x1080" and phone.capture_rotation(options) == 270
 
 
 def test_trimming_drops_the_wait_and_pauses_and_keeps_sync(tmp_path):
@@ -316,10 +481,10 @@ def test_render_follows_the_time_map_of_trimmed_video(tmp_path):
 
     video = tmp_path / "part.mkv"
     source = Source(tmp_path / "part.flac", 0.0, 22.0, video, -5.0, [Segment(0.0, 9.0, 0.0), Segment(13.0, 22.0, 4.0)])
-    edit = Edit(source_duration=22.0, order="script", crossfade_ms=0)
+    edit = Edit(source_duration=22.0, crossfade_ms=0)
     edit.add(2.0, 4.0, sentence=0)
     edit.add(8.0, 15.0, sentence=1)
-    job = RenderJob(edit, [source], tmp_path / "out.mp4", with_video=True)
+    job = RenderJob(edit, [source], tmp_path / "out.mp4", video="h264")
     planned = pieces(job)
     assert [(round(p.local, 3), round(p.duration, 3)) for p in planned] == [(2.0, 2.0), (8.0, 1.0), (9.0, 6.0)]
     inputs, _ = build_inputs(job, planned, VideoInfo({video: 18.0}))

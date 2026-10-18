@@ -19,9 +19,6 @@ ACTIONS = {
     "record": "record",
     "stop": "stop",
     "rehearse": "rehearse",
-    "camera-full": "camera_full",
-    "camera-corner": "camera_corner",
-    "camera-off": "camera_off",
     "layout": "layout",
     "show": "show",
 }

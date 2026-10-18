@@ -5,7 +5,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ ! -x "$root/.venv/bin/python" ]]; then
   uv venv -q --python /usr/bin/python3 "$root/.venv"
   if command -v nvidia-smi >/dev/null; then whisper=whisper-cuda12 torch=cu126; else whisper=whisper torch=cpu; fi
-  VIRTUAL_ENV="$root/.venv" uv pip install -q -e "$root[dev,nvidia,obs,pedal,portal,$whisper]"
+  VIRTUAL_ENV="$root/.venv" uv pip install -q -e "$root[dev,nvidia,pedal,portal,$whisper]"
   # PyTorch's CUDA 12 build shares the cuBLAS and cuDNN that faster-whisper loads; PyPI's default
   # build brings another CUDA whose cuDNN clashes with them in the engine process.
   VIRTUAL_ENV="$root/.venv" uv pip install -q torch --index-url "https://download.pytorch.org/whl/$torch" \

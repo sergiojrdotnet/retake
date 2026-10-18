@@ -18,6 +18,8 @@ class MediaInfo:
     width: int = 0
     height: int = 0
     fps: float = 30.0
+    sample_rate: int = 0
+    channels: int = 0
 
 
 def ffmpeg() -> str:
@@ -40,6 +42,8 @@ def probe(path: Path) -> MediaInfo:
     if video and video.get("avg_frame_rate", "0/0") not in ("0/0", ""):
         num, den = video["avg_frame_rate"].split("/")
         fps = float(num) / float(den) if float(den) else 30.0
+    if video and not 1.0 <= fps <= 240.0:
+        fps = measured_fps(path) or 30.0
     return MediaInfo(
         duration=float(data.get("format", {}).get("duration", 0.0) or 0.0),
         has_video=video is not None,
@@ -47,7 +51,27 @@ def probe(path: Path) -> MediaInfo:
         width=int(video.get("width", 0)) if video else 0,
         height=int(video.get("height", 0)) if video else 0,
         fps=fps,
+        sample_rate=int(audio.get("sample_rate", 0)) if audio else 0,
+        channels=int(audio.get("channels", 0)) if audio else 0,
     )
+
+
+COMMON_RATES = (23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 90.0, 120.0, 240.0)
+
+
+def measured_fps(path: Path, seconds: float = 6.0) -> float | None:
+    """The frame rate from the first frames' timestamps. Phone recordings (scrcpy's MKV) carry a
+    millisecond time base that FFmpeg reports as 1000 fps."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", "-read_intervals", f"%+{seconds}", str(path)],
+        capture_output=True, text=True,
+    )
+    stamps = sorted(float(line.split(",")[0]) for line in result.stdout.split() if line.split(",")[0] not in ("", "N/A"))
+    if len(stamps) < 10 or stamps[-1] <= stamps[0]:
+        return None
+    fps = (len(stamps) - 1) / (stamps[-1] - stamps[0])
+    nearest = min(COMMON_RATES, key=lambda rate: abs(rate - fps))
+    return nearest if abs(nearest - fps) / nearest < 0.03 else round(fps, 3)
 
 
 def first_timestamp(path: Path, stream: str) -> float | None:
@@ -70,7 +94,9 @@ def prepare_phone_video(path: Path) -> None:
     clock (seconds since the phone booted) while the audio starts at zero; the video is moved to
     start where the audio does."""
     video, audio = first_timestamp(path, "v:0"), first_timestamp(path, "a:0")
-    command = [ffmpeg(), "-v", "error", "-y", "-i", str(path), "-map", "0", "-c:v", "copy", "-c:a", "flac"]
+    # MP4 takes ALAC as its lossless audio; MKV takes FLAC.
+    audio_codec = "alac" if path.suffix.lower() in (".mp4", ".mov") else "flac"
+    command = [ffmpeg(), "-v", "error", "-y", "-i", str(path), "-map", "0", "-c:v", "copy", "-c:a", audio_codec]
     if video is not None and audio is not None and abs(video - audio) >= 1.0:
         command += ["-bsf:v", f"setts=pts=PTS-STARTPTS+{audio:.6f}/TB:dts=DTS-STARTDTS+{audio:.6f}/TB"]
     prepared = path.with_name(f".{path.stem}.prepared{path.suffix}")
@@ -93,6 +119,19 @@ def encoders() -> frozenset[str]:
         if len(parts) >= 2 and len(parts[0]) == 6:
             names.add(parts[1])
     return frozenset(names)
+
+
+@cache
+def encoder_works(name: str) -> bool:
+    """Whether this machine can actually use the encoder: a GPU encoder is listed whenever FFmpeg was
+    built with it, even without a GPU (or one too old for the codec) to run it."""
+    if name not in encoders():
+        return False
+    command = [ffmpeg(), "-v", "error", "-f", "lavfi", "-i", "color=s=256x256:d=0.1", "-frames:v", "2", "-c:v", name, "-f", "null", "-"]
+    try:
+        return subprocess.run(command, capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def decode_mono(path: Path, rate: int = 8000, start: float = 0.0, duration: float | None = None) -> np.ndarray:
@@ -213,22 +252,3 @@ def thumbnails(video: Path, directory: Path, every: float = 2.0, height: int = 7
         check=True, capture_output=True,
     )
     return sorted(directory.glob("thumb-*.jpg"))
-
-
-def screen_changes(video: Path, ranges: list[tuple[float, float]], threshold: float = 0.02) -> list[float]:
-    changes = []
-    for start, end in ranges:
-        if end - start < 0.5:
-            continue
-        result = subprocess.run(
-            [ffmpeg(), "-v", "error", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", str(video),
-             "-vf", f"scale=320:-2,select='gt(scene,{threshold})',showinfo", "-f", "null", "-"],
-            capture_output=True, text=True,
-        )
-        for line in result.stderr.splitlines():
-            if "pts_time:" in line:
-                try:
-                    changes.append(start + float(line.split("pts_time:")[1].split()[0]))
-                except ValueError:
-                    continue
-    return changes

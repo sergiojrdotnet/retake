@@ -12,7 +12,6 @@ from .respell import Respeller, ipa as render_ipa
 from .syllables import count as syllable_count
 
 ALL = "all"
-HARD = "hard"
 FLAGGED = "flagged"
 
 
