@@ -88,6 +88,7 @@ DEFAULTS: dict = {
         "handle_before": 0.08,
         "handle_after": 0.15,
         "max_pause": 0.7,
+        "sentence_pause": 0.5,
         "crossfade_ms": 15,
         "camera_crossfade_ms": 0,
     },

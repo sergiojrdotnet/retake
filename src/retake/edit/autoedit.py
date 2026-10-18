@@ -26,6 +26,7 @@ class Rules:
     handle_before: float = 0.08
     handle_after: float = 0.15
     max_pause: float = 0.7
+    sentence_pause: float = 0.5
     extra_speech: str = "between"
     crossfade_ms: int = 15
     camera_crossfade_ms: int = 0
@@ -37,6 +38,7 @@ class Rules:
             handle_before=float(edit.get("handle_before", 0.08)),
             handle_after=float(edit.get("handle_after", 0.15)),
             max_pause=float(edit.get("max_pause", 0.7)),
+            sentence_pause=float(edit.get("sentence_pause", 0.5)),
             extra_speech=strictness.get("extra_speech", "between"),
             crossfade_ms=int(edit.get("crossfade_ms", 15)),
             camera_crossfade_ms=int(edit.get("camera_crossfade_ms", 0)),
@@ -140,6 +142,36 @@ def _meet(edit: Edit, boundaries: list[float]) -> None:
             left.end = right.start
 
 
+def _room_at(quiet: Quiet, time: float) -> tuple[float, float] | None:
+    return next(((a, b) for a, b in quiet.runs(time - 3.0, time + 3.0, 0.02) if a - 0.011 <= time <= b + 0.011), None)
+
+
+def _breathe(edit: Edit, quiet: Quiet | None, pause: float, boundaries: list[float], removable: list, only: set[int] | None = None) -> None:
+    """Two takes joined by a cut get the pause a reader leaves between sentences, from the room's own
+    silence on each side, never reaching into speech; handles alone leave a breathless quarter second."""
+    if quiet is None:
+        return
+    timeline = edit.timeline()
+    for left, right in zip(timeline, timeline[1:]):
+        if abs(left.end - right.start) < 1e-6 or (only is not None and not {left.id, right.id} & only):
+            continue
+        after, before = _room_at(quiet, left.end), _room_at(quiet, right.start)
+        played = (left.end - max(after[0], left.start) if after else 0.0) + (min(before[1], right.end) - right.start if before else 0.0)
+        need = pause - played
+        if need <= 0:
+            continue
+        later = [c.start for c in edit.clips if c.start >= left.end - 1e-6 and c is not left]
+        limit_after = min([after[1] if after else left.end] + later + [a for a, b in removable if a >= left.end] + [b for b in boundaries if b > left.end])
+        earlier = [c.end for c in edit.clips if c.end <= right.start + 1e-6 and c is not right]
+        limit_before = max([before[0] if before else right.start] + earlier + [b for a, b in removable if b <= right.start] + [b for b in boundaries if b <= right.start])
+        tail_room, head_room = max(0.0, limit_after - left.end), max(0.0, right.start - limit_before)
+        head = min(head_room, need / 2)
+        tail = min(tail_room, need - head)
+        head = min(head_room, need - tail)
+        left.end += tail
+        right.start -= head
+
+
 def _take_clips(edit: Edit, take: Take, rules: Rules, duration: float, removable: list, adlibs: list, limits: tuple[float, float],
                 quiet: Quiet | None = None, neighbours: tuple[Take | None, Take | None] = (None, None)) -> None:
     start, end = _edges(take, rules, duration, limits, removable, quiet, *neighbours)
@@ -189,6 +221,7 @@ def auto_edit(log: TakeLog, duration: float, rules: Rules, boundaries: list[floa
     edit.clips.sort(key=lambda c: (c.start, c.id))
     _meet(edit, boundaries)
     _close_small_gaps(edit, rules.max_pause, removable, boundaries)
+    _breathe(edit, quiet, rules.sentence_pause, boundaries, removable)
     edit.normalize()
     return edit
 
@@ -229,15 +262,19 @@ def use_take(edit: Edit, log: TakeLog, take: Take, rules: Rules, duration: float
         edit.alternates[str(take_id)] = [asdict(c) for c in current if c.take == take_id]
     edit.clips = [c for c in edit.clips if c.sentence != sentence]
     saved = edit.alternates.pop(str(take.id), None)
+    boundaries = sorted(boundaries or [])
     if saved:
         for data in saved:
             edit.clips.append(Clip(**{**data, "id": edit.next_id}))
             edit.next_id += 1
-    else:
-        boundaries = sorted(boundaries or [])
-        adlibs = [(m.start, m.end) for m in log.markers_of(kinds.ADLIB)]
-        _take_clips(edit, take, rules, duration, _removable(log, rules), adlibs, _limits(take, boundaries, duration), quiet, _neighbours(take, log))
+        # Its neighbours may have moved since its trims were kept: it mustn't play their audio twice.
         _meet(edit, boundaries)
+    else:
+        adlibs = [(m.start, m.end) for m in log.markers_of(kinds.ADLIB)]
+        removable = _removable(log, rules)
+        _take_clips(edit, take, rules, duration, removable, adlibs, _limits(take, boundaries, duration), quiet, _neighbours(take, log))
+        _meet(edit, boundaries)
+        _breathe(edit, quiet, rules.sentence_pause, boundaries, removable, {c.id for c in edit.clips if c.take == take.id})
     edit.clips.sort(key=lambda c: (c.start, c.id))
     edit.normalize()
     return True

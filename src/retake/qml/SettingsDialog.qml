@@ -340,6 +340,7 @@ RetakeDialog {
                     SettingRow { label: qsTr("Handle before"); section: "edit"; key: "handle_before"; type: "slider"; from: 0; to: 0.5; step: 0.01; decimals: 2 }
                     SettingRow { label: qsTr("Handle after"); section: "edit"; key: "handle_after"; type: "slider"; from: 0; to: 0.8; step: 0.01; decimals: 2 }
                     SettingRow { label: qsTr("Longest pause kept"); section: "edit"; key: "max_pause"; type: "slider"; from: 0.2; to: 2.0; step: 0.05; decimals: 2 }
+                    SettingRow { label: qsTr("Pause between sentences"); section: "edit"; key: "sentence_pause"; type: "slider"; from: 0.1; to: 1.5; step: 0.05; decimals: 2; hint: qsTr("Silence where a cut joins two takes, taken from the room around them") }
                     SettingRow { label: qsTr("Audio crossfade (ms)"); section: "edit"; key: "crossfade_ms"; type: "slider"; from: 0; to: 80 }
                 }
             }

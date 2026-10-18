@@ -2,7 +2,7 @@ from pathlib import Path
 import json
 
 from retake.edit import exports
-from retake.edit.autoedit import Rules, auto_edit
+from retake.edit.autoedit import Rules, auto_edit, use_take
 from retake.edit.edl import Clip, Edit, History
 from retake.edit.quiet import Quiet
 from retake.session import takes as kinds
@@ -556,5 +556,23 @@ def test_cuts_go_in_the_pauses_the_audio_shows_not_at_the_word_times():
     first, second, third = sorted(edit.clips, key=lambda clip: clip.start)
     assert 2.7 <= first.end <= 3.05 and 2.7 <= second.start <= 3.05, "the cut sits in the pause before It"
     assert first.end <= second.start
-    assert 4.65 <= second.end <= 4.85
-    assert 9.1 <= third.start <= 9.25 and third.end >= 10.35
+    assert 4.65 <= second.end <= 5.0
+    assert 9.0 <= third.start <= 9.25 and third.end >= 10.35
+    played = (second.end - 4.65) + (9.25 - third.start)
+    assert abs(played - Rules().sentence_pause) < 0.02, "takes joined by a cut keep a reader's pause"
+
+
+def test_a_take_chosen_again_doesnt_overlap_a_neighbour_that_moved():
+    log = TakeLog()
+    a = log.new_take(0, 1.0, "first"); a.end = 3.0; a.status = COMPLETE
+    a.words = [WordTiming(0, "first", 1.1, 2.8)]
+    b = log.new_take(1, 3.5, "second"); b.end = 5.0; b.status = COMPLETE
+    b.words = [WordTiming(1, "second", 3.6, 4.8)]
+    other = log.new_take(0, 7.0, "first"); other.end = 8.0; other.status = COMPLETE
+    other.words = [WordTiming(0, "first", 7.1, 7.8)]
+    edit = auto_edit(log, 10.0, Rules())
+    use_take(edit, log, other, Rules(), 10.0)
+    next(c for c in edit.clips if c.sentence == 1).start = 2.9
+    use_take(edit, log, a, Rules(), 10.0)
+    clips = sorted(edit.clips, key=lambda c: c.start)
+    assert all(left.end <= right.start + 1e-9 for left, right in zip(clips, clips[1:]))

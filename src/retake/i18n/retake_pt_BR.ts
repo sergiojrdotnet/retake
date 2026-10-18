@@ -2390,6 +2390,14 @@
         <translation>Maior pausa mantida</translation>
     </message>
     <message>
+        <source>Pause between sentences</source>
+        <translation>Pausa entre frases</translation>
+    </message>
+    <message>
+        <source>Silence where a cut joins two takes, taken from the room around them</source>
+        <translation>Silêncio onde um corte junta duas tomadas, tirado do ambiente ao redor delas</translation>
+    </message>
+    <message>
         <location line="+1"/>
         <source>Audio crossfade (ms)</source>
         <translation>Crossfade de áudio (ms)</translation>

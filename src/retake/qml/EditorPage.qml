@@ -10,7 +10,7 @@ Item {
     property real playhead: 0
     property real userPps: 0
     property real pps: userPps > 0 ? userPps : fitPps
-    property real fitPps: Math.max(2, (timelineFlick.width - 20) / Math.max(1, timelineDuration))
+    property real fitPps: Math.max(0.05, (timelineFlick.width - 20) / Math.max(1, timelineDuration))
     // The timeline is the script: the edit as it plays, kept clips back to back. V shows what was cut:
     // each take in use whole, still in script order, its cuts greyed. With nothing kept, the raw
     // recording shows on its own clock.

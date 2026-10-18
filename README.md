@@ -308,7 +308,7 @@ Auto edit rules (Settings → Editing):
 - drop rejected takes, voice commands, reference playback and pauses,
 - drop speech that isn't in the script: keep it, drop it **between sentences** (default) or be **strict** and drop fillers inside sentences too,
 - every cut goes in a pause the audio shows, not at the recognizer's word times (often a few tenths off): a word it missed at a sentence's start or end stays in, a sentence read on into the next one is split in the silence between them, and a sentence read twice in one take keeps the reading that was followed,
-- short handles around every cut, pauses shortened to a maximum, optional audio crossfades,
+- short handles around every cut, pauses shortened to a maximum, and where a cut joins two takes, a reader's pause between them (*Pause between sentences*, 0.5 s) from the room's own silence, optional audio crossfades,
 - the edit plays in script order, whenever and in whichever recording each sentence was read.
 
 The newest take of a sentence goes in, wherever it was recorded: read a sentence again later (or press `R` on it in the studio) and the new take replaces the old one. The side panel next to the video lists every take of the sentence under the playhead, newest first, then the rejected ones; click one to use it and hear it. Each take remembers its own trims, so switching back restores them. The raw recordings are in the Explorer (right-click a recording: *Play the raw recording*).
