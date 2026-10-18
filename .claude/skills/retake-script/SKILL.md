@@ -1,6 +1,6 @@
 ---
 name: retake-script
-description: The script format of Retake, the voice-following teleprompter and recorder. Use when writing, editing, reviewing or converting a script (a Markdown screenplay, talk or course episode) that will be read and recorded with Retake, or its pronunciation lexicon (NAME.lexicon.tsv), and when deciding how a change to an already recorded script affects its takes.
+description: The script format of Retake, the voice-following teleprompter and recorder. Use when writing, editing, reviewing or converting a script (a Markdown or plain-text screenplay, talk or course episode) that will be read and recorded with Retake, or its pronunciation lexicon (NAME.lexicon.tsv), and when deciding how a change to an already recorded script affects its takes.
 ---
 
 # Writing a Retake script
@@ -12,9 +12,17 @@ Markdown with a few conventions. Everything here is what the parser in
 
 ## Files
 
-- `NAME.md`: the script, UTF-8 Markdown.
-- `NAME.lexicon.tsv` (optional, same folder, same stem): pronunciations and spoken forms for
-  words of that script. See [Lexicon](#lexicon).
+- `NAME.md`: the script, UTF-8 Markdown, with everything below.
+- `NAME.txt`: a plain-text script for simple cases. **No markup at all**: blank lines separate
+  paragraphs, sentences end as described in [Sentences](#sentences-the-unit-of-recording), and
+  every word is read (`#`, `[…]`, `{…}`, `//` are just text; a lone symbol is shown, not read).
+  No sections, so no chapters. Numbers are still matched as spoken.
+- `NAME.lexicon.tsv` (optional, same folder, same stem, for either kind): pronunciations and
+  spoken forms for words of that script. See [Lexicon](#lexicon). In a `.txt` script it's the
+  only way to give a pronunciation or a spoken form.
+
+Pick `.txt` for a short read with nothing to annotate; anything with sections, directions, pauses
+or per-occurrence pronunciations needs `.md`.
 
 Check a script before handing it over: `retake check NAME.md` prints the sections, sentence count,
 an estimated duration (140 words a minute) and every problem (words with no known pronunciation,
