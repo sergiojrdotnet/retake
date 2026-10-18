@@ -13,11 +13,15 @@ Column {
     required property var sentences
     spacing: prompter.fontSize * 0.35
 
-    property var tokens: {
+    // One run of words for the paragraph, or one per sentence when each sentence starts a line.
+    property var lines: {
         const result = []
-        for (const sentence of sentences)
+        for (const sentence of sentences) {
+            if (!result.length || prompter.sentenceLines)
+                result.push([])
             for (const token of sentence.tokens)
-                result.push(Object.assign({ sentence: sentence.index }, token))
+                result[result.length - 1].push(Object.assign({ sentence: sentence.index }, token))
+        }
         return result
     }
 
@@ -53,16 +57,19 @@ Column {
         }
     }
 
-    Flow {
-        visible: item.kind !== "adlib"
-        width: parent.width
-        spacing: item.prompter.fontSize * 0.28
-        Repeater {
-            model: item.tokens
-            delegate: TokenItem {
-                required property var modelData
-                token: modelData
-                prompter: item.prompter
+    Repeater {
+        model: item.kind !== "adlib" ? item.lines : []
+        delegate: Flow {
+            required property var modelData
+            width: item.width
+            spacing: item.prompter.fontSize * 0.28
+            Repeater {
+                model: modelData
+                delegate: TokenItem {
+                    required property var modelData
+                    token: modelData
+                    prompter: item.prompter
+                }
             }
         }
     }

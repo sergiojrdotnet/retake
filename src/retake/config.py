@@ -61,6 +61,7 @@ DEFAULTS: dict = {
         "font_size": 44,
         "line_width": 0.82,
         "reading_line": 0.33,
+        "sentence_lines": False,
         "context_before": 1,
         "context_after": 3,
         "mirror": False,

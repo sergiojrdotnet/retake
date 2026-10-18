@@ -213,6 +213,16 @@ def test_words_the_script_repeats_are_not_a_restart():
     assert [take.status for take in log.takes] == [COMPLETE]
 
 
+def test_opening_words_the_sentence_says_again_later_are_no_restart():
+    # Whisper missed "commit ID groups", leaving "...and the the event written..." in the middle.
+    script = parse("The event type says what happened, and the commit ID groups the events written by one append.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    whisper(tracker, "the event type says what happened and the the event written by one append", 0.0)
+    assert [take.status for take in log.takes] == [COMPLETE]
+    assert log.takes[0].start < 0.1
+
+
 def test_dropped_opening_word_starts_the_take_where_speech_began():
     script, log, events, tracker = make_canary()
     tracker.go_to(2)
@@ -223,6 +233,31 @@ def test_dropped_opening_word_starts_the_take_where_speech_began():
     tracker.on_tick(end + 1.0)
     assert log.takes[-1].status == COMPLETE
     assert abs(log.takes[-1].start - (30.0 - 0.15)) < 1e-6
+
+
+def test_two_word_sentence_whose_dropped_opening_was_said_alone_or_run_on():
+    script = parse("Why move now? Four reasons. First, the company is moving.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    t = speak(tracker, "why move now", 0.0)
+    tracker.on_vad(True, t)
+    words, end = tokens("reasons", t + 0.3)
+    tracker.on_words(words, final=True)
+    tracker.on_vad(False, end)
+    tracker.on_tick(end + 1.0)
+    assert [(take.sentence, take.status) for take in log.takes] == [(0, COMPLETE), (1, COMPLETE)]
+    assert abs(log.takes[-1].start - (t - 0.15)) < 1e-6, "the take begins where speech did"
+
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    tracker.on_vad(True, 0.0)
+    words, end = tokens("why move now", 0.0)
+    more, end = tokens("reasons", end + 0.3)
+    tracker.on_words(words + more, final=True)
+    tracker.on_vad(False, end)
+    tracker.on_tick(end + 1.0)
+    assert [(take.sentence, take.status) for take in log.takes] == [(0, COMPLETE), (1, COMPLETE)]
+    assert tracker.sentence == 2
 
 
 def test_words_whisper_adds_from_the_prompt_dont_move_the_prompter_ahead():

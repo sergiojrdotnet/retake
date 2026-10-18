@@ -4,10 +4,20 @@ from dataclasses import asdict, dataclass
 
 from ..session import takes as kinds
 from ..session.takes import COMPLETE, REJECTED, Take, TakeLog
+from ..session.tracker import PREROLL
 from .edl import Clip, Edit
+from .quiet import Quiet
 
 
 BLOCK_CONTEXT = 1.0
+# Whisper's word times can be several tenths off (a word may swallow the pause after it, or start in the
+# pause before it), so each edge goes in the pause the audio shows near them.
+PAUSE = 0.12
+SENTENCE_PAUSE = 0.25
+REACH = 0.5
+TAIL_REACH = 1.0
+# How far before the first word heard a sentence may begin when the recognizer dropped its opening words.
+OPENER_REACH = 1.2
 
 
 @dataclass
@@ -67,9 +77,72 @@ def _removable(log: TakeLog, rules: Rules) -> list[tuple[float, float]]:
     return removable
 
 
-def _take_clips(edit: Edit, take: Take, rules: Rules, duration: float, removable: list, adlibs: list, limits: tuple[float, float]) -> None:
+def _bare(text: str) -> str:
+    return text.strip(".,;:!?\"'()“”‘’…").lower()
+
+
+def _closest(runs: list[tuple[float, float]], side: int, time: float) -> tuple[float, float]:
+    return min(runs, key=lambda r: abs(r[side] - time))
+
+
+def _edges(take: Take, rules: Rules, duration: float, limits: tuple[float, float], removable: list,
+           quiet: Quiet | None, before: Take | None, after: Take | None) -> tuple[float, float]:
     start = max(limits[0], take.start - rules.handle_before)
     end = min(limits[1], duration, (take.end or take.start) + rules.handle_after)
+    script = take.text.split()
+    if not take.words or not script:
+        return start, end
+    first, last = take.words[0], take.words[-1]
+    opener = _bare(first.text) == _bare(script[0])
+    closer = _bare(last.text) == _bare(script[-1])
+    if opener:
+        # The take may have opened on a reading the recognizer lost, then been read again.
+        start = max(start, first.start - PREROLL - rules.handle_before)
+    if quiet is None:
+        return start, end
+    low = max([limits[0], first.start - (REACH if opener else OPENER_REACH)]
+              + [b for a, b in removable if b <= first.start]
+              + ([before.words[-1].start + PAUSE] if before is not None and before.words else []))
+    if opener:
+        runs = quiet.runs(low, max(first.start + PAUSE, first.end - 0.05), PAUSE)
+        found = _closest(runs, 1, first.start) if runs else None
+    else:
+        # The unheard opening sits somewhere before the first word heard: the room is the longest silence.
+        runs = quiet.runs(low, first.start, PAUSE)
+        found = max(runs, key=lambda r: r[1] - r[0]) if runs else None
+    if found:
+        start = max(found[0], found[1] - rules.handle_before)
+    following = (after.words[0].end - 0.05 if after.words else after.start) if after is not None else duration
+    high = min([limits[1], duration, last.end + (TAIL_REACH if closer else OPENER_REACH), following]
+               + [a for a, b in removable if a >= last.start])
+    runs = quiet.runs(last.start + PAUSE, high, PAUSE)
+    if runs:
+        long = [r for r in runs if r[1] - r[0] >= SENTENCE_PAUSE]
+        a, b = _closest(long or runs, 0, last.end)
+        end = min(b, a + rules.handle_after)
+    return start, end
+
+
+def _neighbours(take: Take, log: TakeLog) -> tuple[Take | None, Take | None]:
+    """The readings recorded right before and after this one, kept or not: its edges stay off them."""
+    others = [t for t in log.takes if t.id != take.id and t.end is not None]
+    before = max((t for t in others if t.start < take.start), key=lambda t: t.start, default=None)
+    after = min((t for t in others if t.start > take.start), key=lambda t: t.start, default=None)
+    return before, after
+
+
+def _meet(edit: Edit, boundaries: list[float]) -> None:
+    """Clips of one recording that overlap would play the overlap twice: the earlier one ends where the
+    later one starts, which knows about an opening the recognizer missed."""
+    clips = sorted(edit.clips, key=lambda c: (c.start, c.id))
+    for left, right in zip(clips, clips[1:]):
+        if left.end > right.start > left.start and not any(right.start < b <= left.end for b in boundaries):
+            left.end = right.start
+
+
+def _take_clips(edit: Edit, take: Take, rules: Rules, duration: float, removable: list, adlibs: list, limits: tuple[float, float],
+                quiet: Quiet | None = None, neighbours: tuple[Take | None, Take | None] = (None, None)) -> None:
+    start, end = _edges(take, rules, duration, limits, removable, quiet, *neighbours)
     is_adlib = any(a <= take.start + 0.01 and take.end <= b + 0.01 for a, b in adlibs)
     for piece_start, piece_end in _subtract([(start, end)], removable):
         edit.clips.append(edit_clip(edit, piece_start, piece_end, take, "adlib" if is_adlib else "take"))
@@ -94,7 +167,7 @@ def _good_takes(log: TakeLog) -> dict[int | None, list[Take]]:
     return grouped
 
 
-def auto_edit(log: TakeLog, duration: float, rules: Rules, boundaries: list[float] | None = None) -> Edit:
+def auto_edit(log: TakeLog, duration: float, rules: Rules, boundaries: list[float] | None = None, quiet: Quiet | None = None) -> Edit:
     boundaries = sorted(boundaries or [])
     edit = Edit(source_duration=duration, crossfade_ms=rules.crossfade_ms, camera_crossfade_ms=rules.camera_crossfade_ms, rules=rules.__dict__.copy())
     grouped = _good_takes(log)
@@ -109,17 +182,19 @@ def auto_edit(log: TakeLog, duration: float, rules: Rules, boundaries: list[floa
     else:
         kept_extra = []
     for take in chosen:
-        _take_clips(edit, take, rules, duration, removable, adlibs, _limits(take, boundaries, duration))
+        _take_clips(edit, take, rules, duration, removable, adlibs, _limits(take, boundaries, duration), quiet, _neighbours(take, log))
     for start, end in kept_extra:
         for piece_start, piece_end in _subtract([(start - rules.handle_before, end + rules.handle_after)], removable):
             edit.clips.append(edit_clip(edit, piece_start, piece_end, None, "extra"))
     edit.clips.sort(key=lambda c: (c.start, c.id))
+    _meet(edit, boundaries)
     _close_small_gaps(edit, rules.max_pause, removable, boundaries)
     edit.normalize()
     return edit
 
 
-def update_sentences(edit: Edit, log: TakeLog, sentences: set[int], rules: Rules, duration: float, boundaries: list[float] | None = None) -> list[int]:
+def update_sentences(edit: Edit, log: TakeLog, sentences: set[int], rules: Rules, duration: float, boundaries: list[float] | None = None,
+                     quiet: Quiet | None = None) -> list[int]:
     """Puts the newest take (or the best, with keep="best") of each of these sentences in the edit
     and leaves the rest alone, so a pickup or a later recording doesn't undo hand edits elsewhere.
     Returns the sentences whose take changed."""
@@ -128,7 +203,7 @@ def update_sentences(edit: Edit, log: TakeLog, sentences: set[int], rules: Rules
     updated = []
     for sentence in sorted(sentences):
         takes = grouped.get(sentence)
-        if takes and use_take(edit, log, _choose(takes, rules.keep), rules, duration, boundaries):
+        if takes and use_take(edit, log, _choose(takes, rules.keep), rules, duration, boundaries, quiet):
             updated.append(sentence)
     return updated
 
@@ -142,7 +217,8 @@ def take_choices(log: TakeLog, sentence: int) -> list[Take]:
     return complete + rejected
 
 
-def use_take(edit: Edit, log: TakeLog, take: Take, rules: Rules, duration: float, boundaries: list[float] | None = None) -> bool:
+def use_take(edit: Edit, log: TakeLog, take: Take, rules: Rules, duration: float, boundaries: list[float] | None = None,
+             quiet: Quiet | None = None) -> bool:
     """Puts this take in its sentence's place. The clips of the take it replaces are kept aside and
     come back, trims and all, if that take is chosen again. Returns whether anything changed."""
     sentence = take.sentence
@@ -160,7 +236,8 @@ def use_take(edit: Edit, log: TakeLog, take: Take, rules: Rules, duration: float
     else:
         boundaries = sorted(boundaries or [])
         adlibs = [(m.start, m.end) for m in log.markers_of(kinds.ADLIB)]
-        _take_clips(edit, take, rules, duration, _removable(log, rules), adlibs, _limits(take, boundaries, duration))
+        _take_clips(edit, take, rules, duration, _removable(log, rules), adlibs, _limits(take, boundaries, duration), quiet, _neighbours(take, log))
+        _meet(edit, boundaries)
     edit.clips.sort(key=lambda c: (c.start, c.id))
     edit.normalize()
     return True

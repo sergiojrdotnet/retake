@@ -80,12 +80,17 @@ class WhisperTranscriber:
             no_speech_threshold=0.6,
         )
         words = []
+        window = len(samples) / 16000
         for segment in segments:
             if segment.no_speech_prob > 0.8 or looks_hallucinated(segment.text, segment.compression_ratio, segment.avg_logprob):
                 continue
             for word in segment.words or []:
                 text = word.word.strip()
                 if not text or word.probability < 0.2:
+                    continue
+                # Prompted with the sentence, Whisper finishes a window cut mid-speech by stacking the
+                # prompt's next words at its very end, with no length: they weren't said (yet).
+                if word.end - word.start < 0.01 and word.start >= window - 0.1:
                     continue
                 words.append({
                     "text": text,

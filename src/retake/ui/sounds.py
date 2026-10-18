@@ -19,6 +19,7 @@ CUES: dict[str, tuple[list[tuple[float, float]], float]] = {
     "end": ([(523, 0.1), (659, 0.1), (784, 0.24)], 0.0),
     "pass": ([(1175, 0.07)], 0.0),
     "miss": ([(294, 0.16)], 0.35),
+    "turn": ([(880, 0.05), (1320, 0.07)], 0.0),
 }
 
 
@@ -41,6 +42,8 @@ def cue_for_notice(kind: str, text: str) -> str | None:
         return "pass"
     if kind == "drill-miss":
         return "miss"
+    if kind == "drill-listen":
+        return "turn"
     if kind == "command" and text not in ("pause", "resume", "stop"):
         return "command"
     return None

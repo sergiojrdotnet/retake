@@ -13,20 +13,30 @@ from ..phonetics.ipa import normalize as normalize_ipa
 
 _STRIP = set("ˈˌ.‿ -_|")
 
-_DECOMPOSE = {
-    "ɑːɹ": ("ɑː", "ɹ"), "ɔːɹ": ("ɔː", "ɹ"), "oːɹ": ("oː", "ɹ"), "ɛɹ": ("ɛ", "ɹ"),
-    "ɪɹ": ("ɪ", "ɹ"), "ʊɹ": ("ʊ", "ɹ"), "əl": ("ə", "l"), "aɪɚ": ("aɪ", "ɚ"),
-    "aɪə": ("aɪ", "ə"), "iə": ("i", "ə"), "r": ("ɹ",), "ɫ": ("l",), "n̩": ("ə", "n"),
-    "l̩": ("ə", "l"),
+# Units the multilingual vocabulary has for other languages, which the model writes as their parts when it
+# hears English: aligned whole, a word said perfectly scores near zero on them ("it's" as ɪ + ts).
+_FOREIGN = {
+    "ts": ("t", "s"), "ju": ("j", "uː"), "ɛɹ": ("ɛ", "ɹ"), "ɪɹ": ("ɪ", "ɹ"), "ʊɹ": ("ʊ", "ɹ"),
+    "iə": ("i", "ə"), "r": ("ɹ",), "ʔ": ("t",), "n̩": ("ə", "n"), "l̩": ("ə", "l"),
 }
+_DECOMPOSE = {
+    **_FOREIGN, "ɑːɹ": ("ɑː", "ɹ"), "ɔːɹ": ("ɔː", "ɹ"), "oːɹ": ("oː", "ɹ"), "əl": ("ə", "l"),
+    "aɪɚ": ("aɪ", "ɚ"), "aɪə": ("aɪ", "ə"), "ɫ": ("l",),
+}
+# Symbols the model keeps apart that are one sound to a listener: its multilingual vocabulary writes
+# the vowel of "choice" as oɪ as often as ɔɪ, and length marks come and go. Each variant is heard and
+# scored as the first symbol of its pair, so saying it isn't a miss.
+_SAME = (
+    ("ɔɪ", "oɪ"), ("aɪ", "ai"), ("aʊ", "au"), ("oʊ", "əʊ"), ("iː", "i"), ("uː", "u"),
+    ("ɑː", "ɑ"), ("ɔː", "ɔ"), ("ɜː", "ɜ"), ("ə", "ɐ"),
+)
+_CANONICAL = {variant: symbol for symbol, variant in _SAME}
 _NEAR = [
-    ({"ə", "ɐ", "ʌ", "ᵻ", "ɪ", "ɚ"}, 0.3),
-    ({"ɚ", "ɜː", "ɜ", "ɝ"}, 0.2),
-    ({"ɔː", "ɑː", "ɑ", "ɒ", "ɔ"}, 0.3),
+    ({"ə", "ʌ", "ᵻ", "ɪ", "ɚ"}, 0.3),
+    ({"ɚ", "ɜː", "ɝ"}, 0.2),
+    ({"ɔː", "ɑː", "ɒ"}, 0.3),
     ({"ɾ", "t", "d"}, 0.2),
-    ({"uː", "u"}, 0.1),
-    ({"iː", "i"}, 0.1),
-    ({"oʊ", "o", "oː", "əʊ"}, 0.1),
+    ({"oʊ", "o", "oː"}, 0.1),
     ({"eɪ", "e", "eː"}, 0.1),
 ]
 _ESPEAKISH = {
@@ -50,10 +60,14 @@ def phones_to_espeakish(phones: list[Phone]) -> str:
     return "".join(out)
 
 
+def english_units(symbols: list[str]) -> list[str]:
+    return [part for symbol in symbols for part in _FOREIGN.get(symbol, (symbol,))]
+
+
 def decompose(symbols: list[str]) -> list[str]:
     out: list[str] = []
     for symbol in symbols:
-        out.extend(_DECOMPOSE.get(symbol, (symbol,)))
+        out.extend(_CANONICAL.get(part, part) for part in _DECOMPOSE.get(symbol, (symbol,)))
     return out
 
 
@@ -184,6 +198,8 @@ class PhonemeScorer:
         self.device = device
         self.half = half and device != "cpu"
         self.model, self.vocab = wav2vec2.load(model_dir, device, self.half)
+        self.same = [(self.vocab[a], self.vocab[b]) for a, b in _SAME if a in self.vocab and b in self.vocab]
+        self.canonical = {variant: token for token, variant in self.same}
         self.inverse = {v: k for k, v in self.vocab.items()}
         self.blank = self.vocab.get("<pad>", 0)
         self.voice = voice
@@ -211,7 +227,8 @@ class PhonemeScorer:
                     if alt not in alternatives:
                         alternatives.append(alt)
             scored = word["text"].lower() not in self.function_words
-            result.append(ExpectedWord(word["text"], ipa, tokenize_ipa(ipa, self.vocab), alternatives, scored))
+            tokens = [self.canonical.get(self.vocab[part], self.vocab[part]) for part in english_units(symbols) if part in self.vocab]
+            result.append(ExpectedWord(word["text"], ipa, tokens, alternatives, scored))
         return result
 
     def emissions(self, audio: np.ndarray) -> np.ndarray:
@@ -222,8 +239,11 @@ class PhonemeScorer:
         if self.half:
             tensor = tensor.half()
         with torch.inference_mode():
-            logits = self.model(tensor)[0].float()
-            return torch.log_softmax(logits, dim=-1).cpu().numpy()
+            probabilities = torch.softmax(self.model(tensor)[0].float(), dim=-1).cpu().numpy()
+        for token, variant in self.same:
+            probabilities[:, token] += probabilities[:, variant]
+            probabilities[:, variant] = 0.0
+        return np.log(np.maximum(probabilities, 1e-12))
 
     def score(self, audio: np.ndarray, words: list[dict]) -> list[dict]:
         started = time.perf_counter()

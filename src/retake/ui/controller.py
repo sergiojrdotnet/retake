@@ -366,7 +366,7 @@ class Controller(QObject):
             if action in ("record", "rehearse") and self._page == "session" and not self._starting_video and not self._finishing:
                 self.notice_from_session("command", action)
                 QTimer.singleShot(0, self.record if action == "record" else self.rehearse)
-        elif self.session is not None and kind in ("vad", "words", "command", "score", "progress"):
+        elif self.session is not None and kind in ("vad", "word", "words", "command", "score", "progress"):
             self.session.on_engine(message)
 
     def _play_tts(self, message: dict) -> None:
@@ -461,11 +461,12 @@ class Controller(QObject):
             "pickups-done": "Pickups recorded; back to the studio",
             "uncoached": f"“{text}” won't be coached anymore (Settings → Coach to undo)",
             "drill-none": "No warned words in this sentence or the previous one",
+            "drill-early": f"Too soon: say “{text}” after the cue",
         }
         if kind == "uncoached":
             self.uncoachedChanged.emit()
             self._rebuild_paragraphs()
-        if kind not in ("drill-pass", "drill-miss"):
+        if kind not in ("drill-pass", "drill-miss", "drill-listen"):
             self.notice.emit(kind, messages.get(kind, text))
         if kind == "pickups-done":
             QTimer.singleShot(700, self.stop)
@@ -1580,6 +1581,13 @@ class Controller(QObject):
             job.update({"video": str(video_path), "offset": offset, "method": method})
             if job.get("trim"):
                 job["segments"] = self._trim_video(video_path, duration, offset)
+        self._finishStep.emit(QCoreApplication.translate("Finishing", "Finding the pauses between words…"))
+        try:
+            from ..edit import media
+
+            media.peaks(audio, 100, paths.cache_dir() / "peaks")
+        except Exception as error:
+            self.notice.emit("error", f"Couldn't read the recording's pauses: {error}")
         self._finishStep.emit(QCoreApplication.translate("Finishing", "Opening the studio…"))
         self._finalized.emit(job)
 

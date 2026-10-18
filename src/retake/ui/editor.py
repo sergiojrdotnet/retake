@@ -12,6 +12,7 @@ from .. import paths
 from ..edit import exports, media
 from ..edit.autoedit import Rules, auto_edit, take_blocks, take_choices, use_take
 from ..edit.edl import Edit, History
+from ..edit.quiet import Quiet
 from ..edit import outputs
 from ..edit import render as render_module
 from ..project import Item
@@ -41,6 +42,7 @@ class EditorController(QObject):
         self.duration = 0.0
         self.part_list: list = []
         self._peaks_key = ""
+        self._silences: Quiet | None = None
         self._thumbs: list = []
         self._dirty = False
         # Changes are written shortly after they're made, so a burst of trims is one write.
@@ -73,6 +75,7 @@ class EditorController(QObject):
         self.script = item.load_script()
         self.part_list = item.parts
         self.duration = item.duration
+        self._silences = None
         edit = item.load_edit()
         fresh = edit is None
         if fresh:
@@ -100,6 +103,7 @@ class EditorController(QObject):
         self.log = None
         self.history = None
         self.part_list = []
+        self._silences = None
         self.loadedChanged.emit()
         self.editChanged.emit()
         self.mediaChanged.emit()
@@ -109,25 +113,26 @@ class EditorController(QObject):
         return Rules.from_config(config["edit"], config["strictness"])
 
     def _auto(self) -> Edit:
-        return auto_edit(self.log, self.duration, self.rules(), self.item.boundaries() if self.item else [])
+        return auto_edit(self.log, self.duration, self.rules(), self.item.boundaries() if self.item else [], self._quiet())
+
+    def _quiet(self) -> Quiet | None:
+        """The recording's silences, so cuts land between words; read from the waveform cache that
+        finishing a recording fills."""
+        if self._silences is None and self.part_list:
+            try:
+                self._silences = Quiet(media.joined_peaks(self.part_list, paths.cache_dir() / "peaks"))
+            except Exception as error:
+                self.message.emit("error", f"Couldn't read the recording's pauses ({error}); cuts follow the word times only")
+        return self._silences
 
     def _compute_peaks(self, folder: Path, parts: list, duration: float) -> None:
-        import numpy as np
-
-        chunks = []
         try:
-            for part in parts:
-                expected = int(round(part.duration * 100))
-                values = media.peaks(part.audio, 100, paths.cache_dir() / "peaks") if part.audio.exists() else np.zeros(expected, dtype=np.float32)
-                values = np.asarray(values, dtype=np.float32)[:expected]
-                if len(values) < expected:
-                    values = np.concatenate([values, np.zeros(expected - len(values), dtype=np.float32)])
-                chunks.append(values)
+            values = media.joined_peaks(parts, paths.cache_dir() / "peaks")
         except Exception as error:
             self.message.emit("error", f"Waveform failed: {error}")
             return
         key = f"{folder}#{len(parts)}"
-        publish_peaks(key, np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32))
+        publish_peaks(key, values)
         self._peaksReady.emit(key)
 
     def _on_peaks(self, key: str) -> None:
@@ -206,7 +211,7 @@ class EditorController(QObject):
         if self.edit is None:
             return []
         self._checkpoint()
-        updated = update_sentences(self.edit, self.log, sentences, self.rules(), self.duration, self.item.boundaries())
+        updated = update_sentences(self.edit, self.log, sentences, self.rules(), self.duration, self.item.boundaries(), self._quiet())
         self._changed()
         return updated
 
@@ -287,7 +292,7 @@ class EditorController(QObject):
         if take is None or take.sentence is None or take.end is None:
             return -1.0
         self._checkpoint()
-        if use_take(self.edit, self.log, take, self.rules(), self.duration, self.item.boundaries()):
+        if use_take(self.edit, self.log, take, self.rules(), self.duration, self.item.boundaries(), self._quiet()):
             self._changed()
             self.message.emit("info", f"Sentence {take.sentence + 1}: take {take.number}")
         return min((c.start for c in self.edit.clips if c.take == take.id), default=take.start)

@@ -184,7 +184,7 @@ class ScriptTracker:
             return
         sentence = self.current
         probe = align(self.variants(sentence)[:6], [t.text for t in tokens])
-        if not self._is_start(probe, len(sentence.words)):
+        if not self._is_start(probe, tokens, len(sentence.words)):
             return
         first = probe.matches[0]
         index = self._reach_back(tokens, first.first_token) if first.word > 0 else first.first_token
@@ -213,8 +213,11 @@ class ScriptTracker:
         return tokens[cut:]
 
     def _speech_onset(self, start: float) -> float:
-        """When the recognizer dropped the first word altogether, the take still begins where speech did."""
+        """When the recognizer dropped the first word altogether, the take still begins where speech did,
+        or where the previous sentence ended when the reading ran on into this one."""
         onset = self.speech_start
+        if onset is not None and onset < self.floor:
+            onset = self.floor
         if onset is not None and 0 < start - onset <= OPENER_GAP:
             return onset
         return start
@@ -228,8 +231,7 @@ class ScriptTracker:
         best, size = max(scored)
         return index + size if best >= OPENER_SIMILARITY else index
 
-    @staticmethod
-    def _is_start(probe: Alignment, length: int) -> bool:
+    def _is_start(self, probe: Alignment, tokens: list[HypToken], length: int) -> bool:
         matches = probe.matches
         if not matches:
             return False
@@ -237,7 +239,12 @@ class ScriptTracker:
             return True
         if len(matches) >= 2 and matches[0].word <= 1:
             return True
-        return length <= 2 and matches[0].word == 0
+        if length <= 2 and matches[0].word == 0:
+            return True
+        # Whisper hears a short opening word faintly and drops it ("Four reasons." comes out as
+        # "reasons."): the second word of two is enough when speech began right before it.
+        start = tokens[matches[0].first_token].start
+        return length == 2 and matches[0].word == 1 and self._speech_onset(start) < start
 
     def _consume(self, until: float) -> None:
         self.floor = max(self.floor, until)
@@ -271,7 +278,13 @@ class ScriptTracker:
             first, second = probe.matches[0], probe.matches[1]
             if first.first_token != 0 or first.word > 1 or second.word != first.word + 1 or self._recurs(first.word):
                 continue
-            if align(self.variants(self.current), texts[:i]).last_word < second.word:
+            variants = self.variants(self.current)
+            reached = align(variants, texts[:i]).last_word
+            if reached < second.word:
+                continue
+            # What the rest of the sentence explains as well as a fresh start is the reading going on:
+            # "…and the commit ID groups the events" holds "the event", but it's no new "The event type".
+            if len(align(variants[reached + 1:], texts[i:]).matches) >= len(align(variants, texts[i:]).matches):
                 continue
             restart_at = tokens[self._reach_back(tokens, i) if first.word > 0 else i].start
             if restart_at <= self.take.start + PREROLL + 1e-6:
@@ -358,6 +371,10 @@ class ScriptTracker:
             pause = 0.7
         if self.now - max(end, self.last_speech_end) >= pause or self.now - end >= pause + 0.8:
             self.complete(end=end + TAIL)
+            # Words after the last one may be the next sentence, said in the same breath; no newer
+            # decode may come to look at them.
+            if self.stream.tokens:
+                self._update(False)
 
     def _set_position(self, word: int) -> None:
         if word == self.position:

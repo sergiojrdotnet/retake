@@ -772,6 +772,10 @@
         <translation>Abrindo o estúdio…</translation>
     </message>
     <message>
+        <source>Finding the pauses between words…</source>
+        <translation>Procurando as pausas entre as palavras…</translation>
+    </message>
+    <message>
         <location line="+8"/>
         <source>Trimming the waiting and pauses from the video…</source>
         <translation>Cortando a espera e as pausas do vídeo…</translation>
@@ -1882,6 +1886,14 @@
         <location line="+0"/>
         <source>For teleprompter glass</source>
         <translation>Para vidro de teleprompter</translation>
+    </message>
+    <message>
+        <source>A line per sentence</source>
+        <translation>Uma linha por frase</translation>
+    </message>
+    <message>
+        <source>Each sentence starts on a new line, so its whole shape shows before you read it</source>
+        <translation>Cada frase começa numa linha nova, para você ver a frase inteira antes de lê-la</translation>
     </message>
     <message>
         <location line="+1"/>

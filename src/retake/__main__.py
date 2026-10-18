@@ -121,8 +121,11 @@ def _pick_item(args):
 
 def _render(args) -> int:
     from . import config as config_module
+    from . import paths
+    from .edit import media
     from .edit.autoedit import Rules, auto_edit
     from .edit.outputs import KINDS, export
+    from .edit.quiet import Quiet
 
     _, item = _pick_item(args)
     log = item.load_takes()
@@ -131,7 +134,7 @@ def _render(args) -> int:
     rules = Rules.from_config(config["edit"], config["strictness"])
     edit = None if args.auto else item.load_edit()
     if edit is None:
-        edit = auto_edit(log, duration, rules, item.boundaries())
+        edit = auto_edit(log, duration, rules, item.boundaries(), Quiet(media.joined_peaks(item.parts, paths.cache_dir() / "peaks")))
         item.save_edit(edit)
     script = item.load_script()
     for target in args.targets.split(","):

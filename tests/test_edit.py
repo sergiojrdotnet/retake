@@ -4,8 +4,10 @@ import json
 from retake.edit import exports
 from retake.edit.autoedit import Rules, auto_edit
 from retake.edit.edl import Clip, Edit, History
+from retake.edit.quiet import Quiet
 from retake.session import takes as kinds
 from retake.session.takes import COMPLETE, REJECTED, TakeLog, WordTiming
+import numpy as np
 
 
 def sample_log():
@@ -526,3 +528,33 @@ def test_offset_comes_from_the_soundtracks_even_across_a_pause(tmp_path):
     sf.write(tmp_path / "phone.wav", phone, rate)
     offset, method = media.estimate_offset(tmp_path / "master.flac", tmp_path / "phone.wav", 100.0, video_t0=101.42)
     assert method == "correlation" and abs(offset - delay) < 0.01
+
+
+def _room(speech: list[tuple[float, float]], duration: float) -> Quiet:
+    peaks = np.full(int(duration * 100), 0.001, dtype=np.float32)
+    for a, b in speech:
+        peaks[int(a * 100):int(b * 100)] = 0.3
+    return Quiet(peaks)
+
+
+def test_cuts_go_in_the_pauses_the_audio_shows_not_at_the_word_times():
+    log = TakeLog()
+    # Read in one breath: "...our constraints. It isn't a general recommendation." Whisper stretched
+    # "constraints." over the pause and the next "It", and dropped "It".
+    a = log.new_take(0, 1.0, "Every result is ours, our constraints."); a.status = COMPLETE
+    a.words = [WordTiming(0, "Every", 1.15, 1.5), WordTiming(5, "constraints.", 2.0, 3.2)]
+    a.end = 3.4
+    b = log.new_take(1, 3.05, "It isn't a general recommendation."); b.status = COMPLETE
+    b.words = [WordTiming(7, "isn't", 3.2, 3.6), WordTiming(10, "recommendation.", 3.8, 4.6)]
+    b.end = 4.8
+    # Said twice in one take, the first reading lost by the recognizer: only the second one is kept.
+    c = log.new_take(2, 6.0, "Second, latency."); c.status = COMPLETE
+    c.words = [WordTiming(12, "Second,", 9.3, 9.7), WordTiming(13, "latency.", 9.8, 10.3)]
+    c.end = 10.5
+    room = _room([(1.2, 2.7), (3.05, 3.15), (3.3, 4.65), (6.4, 7.6), (9.25, 10.35)], 12.0)
+    edit = auto_edit(log, 12.0, Rules(), quiet=room)
+    first, second, third = sorted(edit.clips, key=lambda clip: clip.start)
+    assert 2.7 <= first.end <= 3.05 and 2.7 <= second.start <= 3.05, "the cut sits in the pause before It"
+    assert first.end <= second.start
+    assert 4.65 <= second.end <= 4.85
+    assert 9.1 <= third.start <= 9.25 and third.end >= 10.35

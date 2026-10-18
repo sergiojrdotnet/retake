@@ -14,6 +14,7 @@ Item {
     property string mode: app.displayMode
     property real fontSize: prompter.font_size
     property real readingLine: prompter.reading_line
+    property bool sentenceLines: prompter.sentence_lines === true
     property var wordItems: ({})
     property int lastLineY: -1
 

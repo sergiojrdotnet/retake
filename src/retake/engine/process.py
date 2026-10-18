@@ -15,12 +15,14 @@ from ..child import exit_quietly
 from .audio import RATE, AudioHistory, SpeechTimeline
 from .commands import CommandGate, TranscriptCommands
 from .log import OutputLog, log
+from .vad import EnergyVad
 
 UTTERANCE_GAP = 0.8
 WHISPER_INTERVAL = 0.6
 MAX_UTTERANCE = 24.0
 COMMAND_ISOLATION = 0.45
 MAX_TRACKING_LAG = 3.0
+WORD_MARGIN_DB = 15.0
 
 
 class Worker:
@@ -62,6 +64,9 @@ class Engine:
         self.running = True
         self.status: dict[str, dict] = {}
         self.vad = None
+        # Silero often rates a word said on its own as unlikely speech, so drill tries are found by
+        # loudness instead: a word stands well above the room's noise.
+        self.word_vad = EnergyVad(WORD_MARGIN_DB)
         self.tracker = None
         self.whisper = None
         self.transcript_commands: TranscriptCommands | None = None
@@ -336,7 +341,10 @@ class Engine:
                 if start == "reset":
                     if self.vad:
                         self.vad.reset(samples)
+                    self.word_vad.reset(samples)
                     continue
+                for speech, at in self.word_vad.process(start, samples):
+                    self.send({"type": "word", "speech": speech, "time": at})
                 if self.vad is None:
                     continue
                 for speech, at in self.vad.process(start, samples):

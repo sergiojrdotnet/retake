@@ -33,8 +33,9 @@ class Drill:
     """Practice for the words that sank a take: hear the word, say it so many times in a row, then
     read the sentence again from the start.
 
-    Each attempt is one stretch of speech that begins after the reference voice has finished; it's
-    scored as that word alone."""
+    Nothing is heard while the reference voice plays: listening starts once it (and its echo) is
+    over, with a cue. Each attempt is one stretch of speech that begins after the cue; it's scored as
+    that word alone."""
 
     take: Take
     words: list[DrillWord]
@@ -43,10 +44,11 @@ class Drill:
     passes: int = 0
     attempts: int = 0
     last_score: float | None = None
+    listen_at: float | None = None
     listen_from: float | None = None
     voice_deadline: float = 0.0
     speech_start: float | None = None
-    speaking: bool = False
+    early: bool = False
     scoring: bool = False
     attempt: tuple[float, float] | None = None
     held: tuple[float | None, float] | None = None
@@ -62,24 +64,36 @@ class Drill:
 
     def saying(self, now: float) -> None:
         """The reference voice is about to play; nothing heard until it ends counts."""
+        self.listen_at = None
         self.listen_from = None
         self.voice_deadline = now + VOICE_TIMEOUT
         self.speech_start = None
 
     def voice_ended(self, end: float) -> None:
-        self.listen_from = end
-        self.speech_start = end if self.speaking else None
+        self.listen_at = end
+
+    def listen(self, time: float) -> bool:
+        """Starts listening once the voice is over, or never came; True when it just did."""
+        if self.listen_from is not None or time < (self.voice_deadline if self.listen_at is None else self.listen_at):
+            return False
+        self.listen_from = time
+        self.speech_start = None
+        return True
 
     def on_vad(self, speech: bool, time: float) -> tuple[float, float] | None:
-        """Returns the stretch to score when an attempt ends."""
-        self.speaking = speech
+        """Returns the stretch to score when an attempt ends. Speech that began before the cue is
+        no attempt: it holds the voice's echo, or a word with its start cut off."""
+        self.early = False
         if self.listen_from is None or self.scoring:
             return None
         if speech:
-            self.speech_start = max(time, self.listen_from)
+            self.speech_start = time if time >= self.listen_from else None
             return None
         start, self.speech_start = self.speech_start, None
-        if start is None or time - start < SHORTEST_ATTEMPT:
+        if start is None:
+            self.early = time > self.listen_from + SHORTEST_ATTEMPT
+            return None
+        if time - start < SHORTEST_ATTEMPT:
             return None
         return start, time
 

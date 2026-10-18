@@ -132,10 +132,8 @@ class Session:
     def tick(self, time: float) -> None:
         self.now = max(self.now, time)
         self.tracker.on_tick(time)
+        self._drill_listen(time)
         drill = self.drill
-        if drill is not None and drill.listen_from is None and time > drill.voice_deadline:
-            drill.voice_ended(time)
-            self.listener.drill_changed(drill.as_dict())
         if drill is not None and drill.held is not None and time >= drill.held[1]:
             score, _ = drill.held
             drill.held = None
@@ -147,11 +145,17 @@ class Session:
         if kind == "vad":
             self.now = max(self.now, event["time"])
             self.tracker.on_vad(event["speech"], event["time"])
-            if self.drill is not None:
-                attempt = self.drill.on_vad(event["speech"], event["time"])
+            self._run_commands()
+        elif kind == "word":
+            self.now = max(self.now, event["time"])
+            drill = self.drill
+            if drill is not None:
+                self._drill_listen(event["time"])
+                attempt = drill.on_vad(event["speech"], event["time"])
                 if attempt is not None:
                     self._score_attempt(*attempt)
-            self._run_commands()
+                elif drill.early:
+                    self.listener.notice("drill-early", drill.word.text)
         elif kind == "words":
             if event["words"]:
                 self.words_horizon = max(self.words_horizon, event["words"][-1]["end"])
@@ -298,6 +302,11 @@ class Session:
         drill = self.drill
         if drill is not None and drill.listen_from is None:
             drill.voice_ended(end)
+
+    def _drill_listen(self, time: float) -> None:
+        drill = self.drill
+        if drill is not None and drill.listen(time):
+            self.listener.notice("drill-listen", drill.word.text)
             self.listener.drill_changed(drill.as_dict())
 
     def position_changed(self, sentence: int, word: int) -> None:
@@ -510,10 +519,12 @@ class Session:
         drill = self.drill
         if drill is None or drill.done:
             return
-        if event.get("error"):
+        result = (event.get("words") or [{}])[0]
+        if event.get("error") or not result.get("heard"):
+            # Nothing the recognizer could call a sound of speech: a cough or a knock, not a try.
             drill.scoring = False
             return
-        score = (event.get("words") or [{}])[0].get("score")
+        score = result.get("score")
         start, end = drill.attempt or (0.0, 0.0)
         if end - start >= LONG_ATTEMPT:
             drill.held = (score, end + COMMAND_WINDOW)

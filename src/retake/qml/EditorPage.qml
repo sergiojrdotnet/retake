@@ -400,6 +400,10 @@ Item {
             page.resumeAfterLoad = false
             page.currentRow = -1
             page.startAt = 0
+            // A source set to the URL it already has never reloads nor reports "loaded", and the file
+            // may have been recorded again under the same name.
+            player.source = ""
+            picture.source = ""
             Qt.callLater(() => page.seek(page.startAt))
         }
     }

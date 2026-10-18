@@ -117,11 +117,11 @@ def test_a_word_between_the_levels_only_warns():
 
 
 def attempt(session, listener, start, score):
-    session.on_engine({"type": "vad", "speech": True, "time": start})
-    session.on_engine({"type": "vad", "speech": False, "time": start + 0.5})
+    session.on_engine({"type": "word", "speech": True, "time": start})
+    session.on_engine({"type": "word", "speech": False, "time": start + 0.5})
     request = listener.requests("score")[-1]
     assert request["take"] is None and request["words"][0]["text"] == "cache"
-    session.on_engine({"type": "score", "request": request["request"], "words": [{"score": score, "expected": "kæʃ", "heard": ""}]})
+    session.on_engine({"type": "score", "request": request["request"], "words": [{"score": score, "expected": "kæʃ", "heard": "kæʃ"}]})
     return start + 1.0
 
 
@@ -165,9 +165,44 @@ def test_speech_during_the_reference_voice_is_not_an_attempt():
     t = say(session, "we flush the cache to disk", 0.0)
     score_take(session, listener)
     before = len(listener.requests("score"))
-    session.on_engine({"type": "vad", "speech": True, "time": t})
-    session.on_engine({"type": "vad", "speech": False, "time": t + 0.5})
+    session.on_engine({"type": "word", "speech": True, "time": t})
+    session.on_engine({"type": "word", "speech": False, "time": t + 0.5})
     assert len(listener.requests("score")) == before
+
+
+def test_the_drill_listens_from_a_cue_after_the_voice_and_drops_speech_begun_before_it():
+    session, listener = scripted()
+    session.settings.coach.require = 40
+    t = say(session, "we flush the cache to disk", 0.0)
+    score_take(session, listener)
+    before = len(listener.requests("score"))
+    session.tts_played(t, t + 0.6, "cache")
+    session.on_engine({"type": "word", "speech": True, "time": t + 0.1})
+    session.tick(t + 0.7)
+    assert ("notice", ("drill-listen", "cache")) in listener.calls
+    session.on_engine({"type": "word", "speech": False, "time": t + 0.4})
+    assert ("notice", ("drill-early", "cache")) not in listener.calls, "the voice's own echo, heard late"
+    session.on_engine({"type": "word", "speech": True, "time": t + 0.65})
+    session.on_engine({"type": "word", "speech": False, "time": t + 1.3})
+    assert len(listener.requests("score")) == before, "a word begun before the cue is cut short"
+    assert ("notice", ("drill-early", "cache")) in listener.calls
+    attempt(session, listener, t + 1.5, 80)
+    assert session.drill.passes == 1
+
+
+def test_a_noise_in_a_drill_is_not_a_try():
+    session, listener = scripted()
+    session.settings.coach.require = 40
+    t = say(session, "we flush the cache to disk", 0.0)
+    score_take(session, listener)
+    t = voice_done(session, t)
+    session.on_engine({"type": "word", "speech": True, "time": t})
+    session.on_engine({"type": "word", "speech": False, "time": t + 0.4})
+    request = listener.requests("score")[-1]
+    session.on_engine({"type": "score", "request": request["request"], "words": [{"score": 12, "expected": "kæʃ", "heard": ""}]})
+    assert session.drill.attempts == 0 and not session.drill.scoring
+    attempt(session, listener, t + 1.0, 80)
+    assert session.drill.passes == 1
 
 
 def test_skip_and_uncoach_move_on_and_uncoached_words_are_never_scored():
@@ -364,10 +399,10 @@ def test_a_voice_command_during_a_drill_is_not_a_try():
     t = say(session, "we flush the cache to disk", 0.0)
     score_take(session, listener)
     t = voice_done(session, t)
-    session.on_engine({"type": "vad", "speech": True, "time": t})
-    session.on_engine({"type": "vad", "speech": False, "time": t + 1.2})
+    session.on_engine({"type": "word", "speech": True, "time": t})
+    session.on_engine({"type": "word", "speech": False, "time": t + 1.2})
     request = listener.requests("score")[-1]
-    session.on_engine({"type": "score", "request": request["request"], "words": [{"score": 10, "expected": "kæʃ", "heard": ""}]})
+    session.on_engine({"type": "score", "request": request["request"], "words": [{"score": 10, "expected": "kæʃ", "heard": "kɛʃ"}]})
     session.on_engine({"type": "command", "action": "listen", "start": t, "end": t + 1.2})
     session.on_engine({"type": "progress", "time": t + 3})
     session.tick(t + 2.5)

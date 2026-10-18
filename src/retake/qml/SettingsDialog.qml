@@ -119,6 +119,7 @@ RetakeDialog {
                     SettingRow { label: qsTr("Font size"); section: "prompter"; key: "font_size"; type: "slider"; from: 20; to: 96 }
                     SettingRow { label: qsTr("Line width"); section: "prompter"; key: "line_width"; type: "slider"; from: 0.4; to: 1.0; step: 0.02; decimals: 2 }
                     SettingRow { label: qsTr("Reading line"); section: "prompter"; key: "reading_line"; type: "slider"; from: 0.1; to: 0.6; step: 0.01; decimals: 2; hint: qsTr("Height of the line you read from") }
+                    SettingRow { label: qsTr("A line per sentence"); section: "prompter"; key: "sentence_lines"; type: "switch"; hint: qsTr("Each sentence starts on a new line, so its whole shape shows before you read it") }
                     SettingRow { label: qsTr("Mirror"); section: "prompter"; key: "mirror"; type: "switch"; hint: qsTr("For teleprompter glass") }
                     SettingRow { label: qsTr("Animations"); section: "prompter"; key: "animation"; type: "switch" }
                     SettingRow { label: qsTr("Show cues and pauses"); section: "prompter"; key: "show_cues"; type: "switch" }

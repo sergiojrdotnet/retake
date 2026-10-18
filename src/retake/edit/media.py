@@ -242,6 +242,19 @@ def peaks(path: Path, per_second: int = 100, cache_dir: Path | None = None) -> n
     return result.astype(np.float32)
 
 
+def joined_peaks(parts: list, cache_dir: Path | None = None, per_second: int = 100) -> np.ndarray:
+    """The peaks of an item's parts end to end, on its timeline; silence where a part's audio is missing."""
+    chunks = []
+    for part in parts:
+        expected = int(round(part.duration * per_second))
+        values = peaks(part.audio, per_second, cache_dir) if part.audio.exists() else np.zeros(expected, dtype=np.float32)
+        values = np.asarray(values, dtype=np.float32)[:expected]
+        if len(values) < expected:
+            values = np.concatenate([values, np.zeros(expected - len(values), dtype=np.float32)])
+        chunks.append(values)
+    return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+
+
 def thumbnails(video: Path, directory: Path, every: float = 2.0, height: int = 72) -> list[Path]:
     directory.mkdir(parents=True, exist_ok=True)
     existing = sorted(directory.glob("thumb-*.jpg"))
