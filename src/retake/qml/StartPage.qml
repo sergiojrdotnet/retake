@@ -51,6 +51,7 @@ Item {
             columns: 2
             columnSpacing: 14
             rowSpacing: 14
+            uniformCellWidths: true
             Layout.fillWidth: true
             BigButton { title: qsTr("New project"); hint: "Ctrl+N"; detail: qsTr("A course or series; import its scripts"); onClicked: window.openNewProject() }
             BigButton { title: qsTr("Open project"); hint: "Ctrl+O"; detail: qsTr("A .retake file"); onClicked: app.openProjectDialog() }
