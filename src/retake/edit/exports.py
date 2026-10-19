@@ -19,11 +19,13 @@ def _stamp(seconds: float, separator: str = ".") -> str:
     return f"{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}".replace(".", separator)
 
 
-def edited_words(log: TakeLog, edit: Edit) -> list[tuple[float, float, str]]:
+def edited_words(log: TakeLog, edit: Edit, aligned: dict[int, list[dict]] | None = None) -> list[tuple[float, float, str]]:
+    """The cut's words in output time: aligned ones where given (every script word), else the recognizer's."""
+    aligned = aligned or {}
     kept_takes = {c.take for c in edit.clips if c.take is not None}
-    words = []
+    words = [(row["output_start"], row["output_end"], row["text"]) for rows in aligned.values() for row in rows]
     for take in log.takes:
-        if take.id not in kept_takes:
+        if take.id not in kept_takes or take.sentence in aligned:
             continue
         for word in take.words:
             start = edit.to_output(word.start)
@@ -487,7 +489,7 @@ def timeline_file(log: TakeLog, edit: Edit | None, sources: list, probes: dict, 
     return TIMELINE_FORMATS[fmt], text
 
 
-def script_timing(script, log: TakeLog, edit: Edit | None, name: str = "") -> dict:
+def script_timing(script, log: TakeLog, edit: Edit | None, name: str = "", aligned: dict[int, list[dict]] | None = None) -> dict:
     complete = [t for t in log.takes if t.status == "complete" and t.sentence is not None]
     clips_by_take: dict[int, list] = {}
     if edit is not None:
@@ -528,6 +530,16 @@ def script_timing(script, log: TakeLog, edit: Edit | None, name: str = "") -> di
                 end = edit.to_output(clips[-1].end)
                 if start is not None and end is not None:
                     entry["output"] = {"start": round(start, 3), "end": round(end, 3)}
+            if aligned and sentence.index in aligned and edit is not None:
+                scores = {word.word: word.score for word in chosen.words if word.score is not None}
+                for row in aligned[sentence.index]:
+                    entry["words"].append({
+                        "text": row["text"], "source_start": round(row["source_start"], 3), "source_end": round(row["source_end"], 3),
+                        "output_start": round(row["output_start"], 3), "output_end": round(row["output_end"], 3),
+                        **({"score": scores[row["word"]]} if row["word"] in scores else {}),
+                    })
+                sentences.append(entry)
+                continue
             for word in chosen.words:
                 row = {"text": word.text, "source_start": round(word.start, 3), "source_end": round(word.end, 3)}
                 if edit is not None:

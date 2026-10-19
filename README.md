@@ -324,7 +324,7 @@ The studio saves every change into the `.retake` file as you make it (there's no
 | Captions | SRT, WebVTT, WebVTT word by word, or a plain transcript; 32–42 characters per line, one or two lines (burned-in captions use the same layout, sized for portrait or landscape). | `out/captions.srt`, `captions.vtt`, `captions-words.vtt`, `transcript.txt` |
 | Timeline | OpenTimelineIO (Resolve, Kdenlive), Final Cut Pro 7 XML (Premiere, Resolve, Kdenlive, Shotcut) or CMX 3600 EDL; points at the original recordings, cut as in the edit, with your markers (OTIO and XML). | `out/timeline.otio`, `timeline.xml`, `timeline.edl` |
 | Labels | – | `out/labels.txt` for Audacity |
-| Script timing | `out/sentences.json`: every sentence, beat and section with its edited (and source) times, words and your `[[id]]`/`[[b…]]` metadata, for driving other pipelines |
+| Script timing | `out/sentences.json`: every sentence, beat and section with its edited (and source) times, every script word timed in the audio (aligned with the coach's phoneme model, so words the recognizer missed are there too) and your `[[id]]`/`[[b…]]` metadata, for driving other pipelines |
 | Raw | `out/raw.otio` + labels: the untouched recording with every marker, to edit elsewhere |
 
 Headless: `retake render <project.retake> --item ep1 --auto --targets video,audio,timeline,captions,sentences`, with the formats last chosen in the Export dialogs.

@@ -228,6 +228,42 @@ def test_script_timing_carries_ids_and_beats():
     assert timing["sections"][2]["start"] > timing["sections"][1]["start"]
 
 
+def test_every_script_word_is_timed_in_the_audio_its_clips_play(tmp_path):
+    import soundfile as sf
+    from retake.edit import wordtimes
+    from retake.edit.render import Source
+    from retake.languages import packs
+    from retake.script.parser import parse
+
+    script = parse("Intro here. The other ninety three is storage.", packs.get("en"))
+    sf.write(tmp_path / "part-001.flac", np.zeros(16000 * 10, dtype=np.float32), 16000)
+    log = TakeLog()
+    take = log.new_take(1, 2.0, script.sentences[1].text); take.end, take.status = 8.0, COMPLETE
+    # The recognizer heard only the end: "is storage".
+    take.words = [WordTiming(script.sentences[1].words[4].index, "is", 6.0, 6.3, score=88.0), WordTiming(script.sentences[1].words[5].index, "storage.", 6.3, 7.0)]
+    edit = Edit(source_duration=10.0)
+    edit.add(0.5, 1.5, sentence=0)
+    edit.add(2.0, 4.0, take=take.id, sentence=1)
+    edit.add(5.0, 8.0, take=take.id, sentence=1)
+
+    class Scorer:
+        def score(self, audio, words):
+            assert len(audio) == 16000 * 5
+            return [{"start": 0.5 * i + 0.1, "end": 0.5 * i + 0.4} for i in range(len(words))]
+
+    aligned = wordtimes.align(script, log, edit, [Source(tmp_path / "part-001.flac", 0.0, 10.0)], scorer=Scorer())
+    rows = aligned[1]
+    assert [r["text"] for r in rows] == [w.display for w in script.sentences[1].words]
+    assert abs(rows[0]["source_start"] - 2.1) < 1e-6 and abs(rows[0]["output_start"] - 1.1) < 1e-6
+    # The fifth word (2.1 s in) falls in the second clip, 0.1 s after it starts.
+    assert abs(rows[4]["source_start"] - 5.1) < 1e-6 and abs(rows[4]["output_start"] - 3.1) < 1e-6
+    timing = exports.script_timing(script, log, edit, "demo", aligned)
+    words = timing["sentences"][1]["words"]
+    assert [w["text"] for w in words] == [w.display for w in script.sentences[1].words]
+    assert words[4]["score"] == 88.0 and "score" not in words[0]
+    assert [w[2] for w in exports.edited_words(log, edit, aligned)] == [w.display for w in script.sentences[1].words]
+
+
 def test_stage_directions_tables_symbols_and_spoken_forms():
     from retake.languages import packs
     from retake.script.parser import parse

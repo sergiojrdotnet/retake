@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from . import exports, media
+from . import exports, media, wordtimes
 from .edl import Edit
 from .render import audio_job, render_with_fallback, video_job
 
@@ -23,6 +23,14 @@ def probes(sources, probe: Callable = media.probe) -> dict:
     return found
 
 
+def _aligned(item, log, edit: Edit, script, progress: Callable[[float], None] = lambda fraction: None) -> dict[int, list[dict]]:
+    if script is None:
+        return {}
+    from ..script.lexicon import Lexicon
+
+    return wordtimes.align(script, log, edit, item.parts, item.project.language, Lexicon.for_script(item.script_file), progress=progress)
+
+
 def export(kind: str, item, log, edit: Edit, settings: dict, script=None, probe: Callable = media.probe,
            progress: Callable[[float], None] = lambda fraction: None) -> Path:
     """Writes one kind of export into the item's out folder, with the choices in settings (config
@@ -34,11 +42,11 @@ def export(kind: str, item, log, edit: Edit, settings: dict, script=None, probe:
     if kind in ("video", "audio"):
         extra = {"chapters": exports.chapters(log, edit, script) if settings.get("chapters") else [], "title": name, "progress": progress}
         if kind == "video":
-            captions = exports.edited_words(log, edit) if settings.get("burn_captions") else []
+            captions = exports.edited_words(log, edit, _aligned(item, log, edit, script)) if settings.get("burn_captions") else []
             return render_with_fallback(video_job(edit, sources, out, settings, captions=captions, **extra))
         return render_with_fallback(audio_job(edit, sources, out, settings, **extra))
     if kind == "captions":
-        filename, text = exports.captions_file(exports.edited_words(log, edit), settings)
+        filename, text = exports.captions_file(exports.edited_words(log, edit, _aligned(item, log, edit, script, progress)), settings)
     elif kind == "timeline":
         filename, text = exports.timeline_file(log, edit, sources, probes(sources, probe), settings, name, script)
     elif kind == "raw":
@@ -49,7 +57,8 @@ def export(kind: str, item, log, edit: Edit, settings: dict, script=None, probe:
     elif kind == "sentences":
         if script is None:
             raise ValueError("this recording has no script")
-        filename, text = "sentences.json", json.dumps(exports.script_timing(script, log, edit, item.id), indent=1, ensure_ascii=False)
+        timing = exports.script_timing(script, log, edit, item.id, _aligned(item, log, edit, script, progress))
+        filename, text = "sentences.json", json.dumps(timing, indent=1, ensure_ascii=False)
     else:
         raise ValueError(f"unknown export: {kind}")
     return exports.write(out / filename, text)
