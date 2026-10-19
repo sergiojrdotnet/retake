@@ -185,6 +185,7 @@ class ScriptTracker:
         sentence = self.current
         probe = align(self.variants(sentence)[:6], [t.text for t in tokens])
         if not self._is_start(probe, tokens, len(sentence.words)):
+            self._maybe_go_on(tokens, final)
             return
         first = probe.matches[0]
         index = self._reach_back(tokens, first.first_token) if first.word > 0 else first.first_token
@@ -195,6 +196,17 @@ class ScriptTracker:
         self._keep_from(start)
         self._start_take(start)
         self._update(final)
+
+    def _maybe_go_on(self, tokens: list[HypToken], final: bool) -> None:
+        """The reader is on the next sentence while the prompter isn't (moved back, or a command
+        misheard as "back"): three of its opening words in order are enough to follow."""
+        following = self.script.next_sentence(self.sentence)
+        if following is None or not self.script.sentences[following].trackable:
+            return
+        ahead = align(self.variants(self.script.sentences[following])[:6], [t.text for t in tokens])
+        if len(ahead.matches) >= 3 and ahead.matches[0].word <= 1:
+            self._go_to(following)
+            self._maybe_start(tokens, final)
 
     def _expire(self, tokens: list[HypToken]) -> list[HypToken]:
         """Lets go of what can no longer begin the sentence: speech before a long pause or older than the window."""
@@ -278,9 +290,13 @@ class ScriptTracker:
             first, second = probe.matches[0], probe.matches[1]
             if first.first_token != 0 or first.word > 1 or second.word != first.word + 1 or self._recurs(first.word):
                 continue
+            # A reader starting over says the opening words together and Whisper hears them alike; loose
+            # matches ("three" for "the") or ones heard apart are the reading going on.
+            if second.first_token > first.last_token + 2 or min(first.similarity, second.similarity) < 0.8:
+                continue
             variants = self.variants(self.current)
             reached = align(variants, texts[:i]).last_word
-            if reached < second.word:
+            if reached < second.word or self._said_later(reached, texts[i:i + 2]) or self._next_begins(texts[i:i + 6], len(probe.matches)):
                 continue
             # What the rest of the sentence explains as well as a fresh start is the reading going on:
             # "…and the commit ID groups the events" holds "the event", but it's no new "The event type".
@@ -294,6 +310,29 @@ class ScriptTracker:
             self._start_take(restart_at)
             self._update(False)
             return True
+        return False
+
+    def _next_begins(self, texts: list[str], matched: int) -> bool:
+        """Whether these words start the next sentence at least as well: the reader moved on ("One of
+        the extras…" after "On the side… as jsonb", its last word unheard), it's no restart."""
+        following = self.script.next_sentence(self.sentence)
+        if following is None or not self.script.sentences[following].trackable:
+            return False
+        probe = align(self.variants(self.script.sentences[following])[:6], texts)
+        return len(probe.matches) >= max(2, matched) and probe.matches[0].word == 0
+
+    def _said_later(self, reached: int, pair: list[str]) -> bool:
+        """Whether the rest of the sentence begins with these words too, as far as they go: "…year ten,
+        about 1.6" starts like "About one billion" until the number is heard whole."""
+        words = self.current.words
+        for k in range(reached + 1, len(words)):
+            for variant in words[k].variants:
+                if variant[:1] != pair[:1]:
+                    continue
+                if len(pair) < 2 or variant[1:2] == pair[1:2]:
+                    return True
+                if len(variant) == 1 and (k + 1 >= len(words) or any(v[:1] == pair[1:2] for v in words[k + 1].variants)):
+                    return True
         return False
 
     def _recurs(self, word: int) -> bool:
@@ -334,19 +373,27 @@ class ScriptTracker:
         next_sentence = self.script.sentences[following]
         if next_sentence.kind == ADLIB:
             return False
-        last_token = max((m.last_token for m in alignment.matches), default=-1)
-        tail = tokens[last_token + 1:]
-        if len(tail) < 2:
-            return False
-        probe = align(self.variants(next_sentence)[:4], [t.text for t in tail])
-        if len(probe.matches) >= 2 and probe.matches[0].word == 0:
-            start = tail[probe.matches[0].first_token].start
-            self._set_position(len(words) - 1)
-            self.complete(end=tokens[last_token].end + TAIL)
-            self._keep_from(start)
-            self._start_take(start)
-            self._update(False)
-            return True
+        matches = alignment.matches
+        readings = [alignment]
+        # The last word may have been matched far ahead, past the next sentence read on in the same
+        # breath: "…another writer. Reads are about two per write" gives "writer" to "write".
+        if len(matches) >= 2 and matches[-1].first_token - matches[-2].last_token > 2 and matches[-2].word >= len(words) - 2:
+            readings.append(Alignment(matches[:-1], alignment.inserted, alignment.skipped + [matches[-1].word], alignment.score))
+        for reading in readings:
+            last_token = max((m.last_token for m in reading.matches), default=-1)
+            tail = tokens[last_token + 1:]
+            if len(tail) < 2:
+                continue
+            probe = align(self.variants(next_sentence)[:4], [t.text for t in tail])
+            if len(probe.matches) >= 2 and probe.matches[0].word == 0:
+                start = tail[probe.matches[0].first_token].start
+                self.alignment = reading
+                self._set_position(len(words) - 1)
+                self.complete(end=tokens[last_token].end + TAIL)
+                self._keep_from(start)
+                self._start_take(start)
+                self._update(False)
+                return True
         return False
 
     def _check_completion(self) -> None:

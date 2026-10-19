@@ -15,6 +15,8 @@ from .drill import COMMAND_WINDOW, LONG_ATTEMPT, ON_DEMAND_TIMES, PASSED, SKIPPE
 from .takes import COMPLETE, REJECTED, Take, TakeLog
 from .tracker import ScriptTracker
 
+COMMAND_WAIT = 1.5
+STALE_COMMAND = 5.0
 READY = "ready"
 LISTENING = "listening"
 PAUSED = "paused"
@@ -195,7 +197,14 @@ class Session:
     def _run_commands(self) -> None:
         while self.pending_commands:
             event = self.pending_commands[0]
-            caught_up = self.words_horizon >= event["end"] + 0.3 or not self.tracking_active
+            if event["start"] > self.now + STALE_COMMAND:
+                # Timed by another recording's clock (a late message from the previous one): waiting
+                # for this recording to reach it would hold every command behind it.
+                self.pending_commands.pop(0)
+                continue
+            # A command waits for the words said before it to be followed, but not for long: in
+            # silence no transcript comes to catch up with it.
+            caught_up = self.words_horizon >= event["end"] + 0.3 or not self.tracking_active or self.now >= event["end"] + COMMAND_WAIT
             if not caught_up:
                 return
             self.pending_commands.pop(0)
@@ -372,6 +381,7 @@ class Session:
                 "index": timing.word,
                 "text": text.strip(".,;:!?\"'()[]"),
                 "override": override,
+                "say": [] if override else self._readings(timing.word),
                 "start": timing.start,
                 "end": timing.end,
             })
@@ -512,8 +522,17 @@ class Session:
             "take": None,
             "start": max(0.0, start - 0.1),
             "end": end + 0.15,
-            "words": [{"index": word.index, "text": word.text, "override": word.override, "start": start, "end": end}],
+            "words": [{"index": word.index, "text": word.text, "override": word.override, "say": [] if word.override else self._readings(word.index),
+                       "start": start, "end": end}],
         })
+
+    def _readings(self, index: int) -> list[str]:
+        """The other ways the script lets this word be said ("1,210": twelve ten, one thousand two
+        hundred ten), so the coach scores the one that was said, not just espeak's."""
+        if index < 0:
+            return []
+        variants = self.script.words[index].variants
+        return [" ".join(variant) for variant in variants] if len(variants) > 1 else []
 
     def _drill_scored(self, event: dict) -> None:
         drill = self.drill

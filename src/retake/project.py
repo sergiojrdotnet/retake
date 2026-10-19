@@ -325,6 +325,16 @@ class Project:
     def item(self, item_id: str) -> Item | None:
         return next((item for item in self.items if item.id == item_id), None)
 
+    @property
+    def last_opened(self) -> tuple[str, str] | None:
+        """The script open last and its view ("prompter" or "studio"), while it's still in the project."""
+        last = self.data.get("last_opened") or {}
+        return (last["item"], last.get("view", "prompter")) if self.item(last.get("item", "")) else None
+
+    def remember_opened(self, item_id: str, view: str) -> None:
+        self.data["last_opened"] = {"item": item_id, "view": view}
+        self.store.save_value("last_opened", self.data["last_opened"])
+
     # Creating, loading and saving
 
     @classmethod

@@ -16,8 +16,10 @@ PAUSE = 0.12
 SENTENCE_PAUSE = 0.25
 REACH = 0.5
 TAIL_REACH = 1.0
-# How far before the first word heard a sentence may begin when the recognizer dropped its opening words.
+# How far before the first word heard a sentence may begin when the recognizer dropped its opening words,
+# and how long a reader may pause after a label like "Performance:".
 OPENER_REACH = 1.2
+LABEL_PAUSE = 1.5
 
 
 @dataclass
@@ -83,6 +85,17 @@ def _bare(text: str) -> str:
     return text.strip(".,;:!?\"'()“”‘’…").lower()
 
 
+def _merged(runs: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """A breath or a click a frame long doesn't split one pause in two."""
+    out: list[tuple[float, float]] = []
+    for a, b in runs:
+        if out and a - out[-1][1] < 0.06:
+            out[-1] = (out[-1][0], b)
+        else:
+            out.append((a, b))
+    return out
+
+
 def _closest(runs: list[tuple[float, float]], side: int, time: float) -> tuple[float, float]:
     return min(runs, key=lambda r: abs(r[side] - time))
 
@@ -102,25 +115,44 @@ def _edges(take: Take, rules: Rules, duration: float, limits: tuple[float, float
         start = max(start, first.start - PREROLL - rules.handle_before)
     if quiet is None:
         return start, end
-    low = max([limits[0], first.start - (REACH if opener else OPENER_REACH)]
-              + [b for a, b in removable if b <= first.start]
+    # An unheard opening sits somewhere before the first word heard, and a label ("Performance: the
+    # load…") leaves a pause of its own after it.
+    missing = 0 if opener else next((i for i, word in enumerate(script) if _bare(word) == _bare(first.text)), 1)
+    labels = sum(1 for word in script[:missing] if word[-1] in ":,;—–")
+    reach = REACH if opener else OPENER_REACH + 0.5 * max(0, missing - 1) + LABEL_PAUSE * labels
+    bounds = ([limits[0]] + [b for a, b in removable if b <= first.start]
               + ([before.words[-1].start + PAUSE] if before is not None and before.words else []))
+    low = max(bounds + [first.start - reach])
     if opener:
         runs = quiet.runs(low, max(first.start + PAUSE, first.end - 0.05), PAUSE)
+        if not runs:
+            # Speech right up to the word: Whisper timed it late, as it can a long one ("EventSourcingDB").
+            runs = quiet.runs(max(bounds + [first.start - OPENER_REACH]), first.start, PAUSE)[-1:]
         found = _closest(runs, 1, first.start) if runs else None
     else:
-        # The unheard opening sits somewhere before the first word heard: the room is the longest silence.
-        runs = quiet.runs(low, first.start, PAUSE)
+        # The room is the longest silence before the labels' pauses.
+        runs = _merged(quiet.runs(low, first.start, PAUSE))
+        if labels and len(runs) > labels:
+            runs = runs[:-labels]
         found = max(runs, key=lambda r: r[1] - r[0]) if runs else None
     if found:
         start = max(found[0], found[1] - rules.handle_before)
     following = (after.words[0].end - 0.05 if after.words else after.start) if after is not None else duration
-    high = min([limits[1], duration, last.end + (TAIL_REACH if closer else OPENER_REACH), following]
-               + [a for a, b in removable if a >= last.start])
+    unheard = 0 if closer else next((i for i, word in enumerate(reversed(script)) if _bare(word) == _bare(last.text)), 1)
+    tail_labels = sum(1 for word in script[len(script) - 1 - unheard:-1] if word[-1] in ":,;—–") if unheard else 0
+    reach = TAIL_REACH if closer else OPENER_REACH + 0.5 * max(0, unheard - 1) + LABEL_PAUSE * tail_labels
+    high = min([limits[1], duration, last.end + reach, following] + [a for a, b in removable if a >= last.start])
     runs = quiet.runs(last.start + PAUSE, high, PAUSE)
     if runs:
-        long = [r for r in runs if r[1] - r[0] >= SENTENCE_PAUSE]
-        a, b = _closest(long or runs, 0, last.end)
+        if closer:
+            long = [r for r in runs if r[1] - r[0] >= SENTENCE_PAUSE]
+            a, b = _closest(long or runs, 0, last.end)
+        else:
+            # Unheard closing words ("…in a bucket: 1.6.") end at the sentence's own pause, past the labels'.
+            runs = _merged(runs)
+            if tail_labels and len(runs) > tail_labels:
+                runs = runs[tail_labels:]
+            a, b = max(runs, key=lambda r: r[1] - r[0])
         end = min(b, a + rules.handle_after)
     return start, end
 

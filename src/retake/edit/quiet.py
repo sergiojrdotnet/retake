@@ -26,5 +26,6 @@ class Quiet:
         found = []
         for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
             if (b - a) / self.per_second >= shortest:
-                found.append(((first + a) / self.per_second, (first + b) / self.per_second))
+                # Plain floats: numpy's reach the studio's QML as objects it can't do sums with.
+                found.append((float(first + a) / self.per_second, float(first + b) / self.per_second))
         return found

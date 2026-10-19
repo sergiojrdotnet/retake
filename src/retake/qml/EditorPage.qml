@@ -9,8 +9,9 @@ Item {
     signal exportRequested(string kind)
     property real playhead: 0
     property real userPps: 0
-    property real pps: userPps > 0 ? userPps : fitPps
-    property real fitPps: Math.max(0.05, (timelineFlick.width - 20) / Math.max(1, timelineDuration))
+    // Never narrower than the timeline: a zoom chosen at fit stays fit when the panel grows.
+    property real pps: Math.max(userPps, fitPps)
+    property real fitPps: timelineFlick.width > 40 && timelineDuration > 0 ? Math.max(0.05, (timelineFlick.width - 20) / timelineDuration) : 1
     // The timeline is the script: the edit as it plays, kept clips back to back. V shows what was cut:
     // each take in use whole, still in script order, its cuts greyed. With nothing kept, the raw
     // recording shows on its own clock.
@@ -229,8 +230,8 @@ Item {
     // Zooming keeps the moment under the mouse, or the playhead, at the same place on screen.
     function zoomTo(newPps, anchorX) {
         const time = (timelineFlick.contentX + anchorX) / pps
-        userPps = Math.max(fitPps, Math.min(400, newPps))
-        zoomed = userPps > fitPps + 0.01
+        userPps = newPps > fitPps + 0.01 ? Math.min(400, newPps) : 0
+        zoomed = userPps > 0
         timelineFlick.contentX = Math.max(0, Math.min(timelineFlick.contentWidth - timelineFlick.width, time * pps - anchorX))
     }
 
@@ -393,6 +394,8 @@ Item {
         function onLoadedChanged() {
             page.userPps = 0
             page.zoomed = false
+            // Another script's timeline may have been scrolled far past where this one ends.
+            timelineFlick.contentX = 0
             page.selected = []
             page.anchorSentence = -1
             page.partIndex = -1
@@ -606,6 +609,10 @@ Item {
                 flickableDirection: Flickable.HorizontalFlick
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AlwaysOn }
+                // A shorter edit or a wider window leaves no content past the old scroll position.
+                function keepInside() { contentX = Math.max(0, Math.min(contentX, contentWidth - width)) }
+                onContentWidthChanged: keepInside()
+                onWidthChanged: keepInside()
 
                 Item {
                     id: lanes

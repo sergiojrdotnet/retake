@@ -455,3 +455,23 @@ def test_stopping_ends_the_session_with_or_without_a_take_in_progress():
     assert session.tracker.take is not None
     session.stop()
     assert session.state == "stopped" and session.log.takes[-1].status == REJECTED
+
+
+def test_a_number_is_scored_against_every_reading_the_script_allows():
+    script = parse("It handles 1,210 appends per second.", packs.get("en"))
+    listener = Listener()
+    session = Session(TakeLog(), SessionSettings(), listener, script, packs.get("en"), packs.get("pt-BR"))
+    session.start()
+    say(session, "it handles twelve ten appends per second", 0.0)
+    number = next(w for w in listener.requests("score")[0]["words"] if w["text"] == "1,210")
+    assert number["say"] == ["twelve hundred ten", "one thousand two hundred ten", "twelve ten"]
+
+
+def test_a_late_command_from_another_recording_doesnt_hold_the_next_ones():
+    session, listener = scripted()
+    say(session, "we flush the cache to disk", 0.0)
+    session.on_engine({"type": "command", "action": "again", "start": 1218.4, "end": 1219.5, "phrase": "retake again"})
+    session.on_engine({"type": "command", "action": "back", "start": 3.0, "end": 3.8, "phrase": "retake back"})
+    session.tick(5.5)
+    assert session.tracker.sentence == 0, "back ran although the transcript never caught up"
+    assert not session.pending_commands

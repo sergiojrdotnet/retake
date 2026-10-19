@@ -562,6 +562,30 @@ def test_cuts_go_in_the_pauses_the_audio_shows_not_at_the_word_times():
     assert abs(played - Rules().sentence_pause) < 0.02, "takes joined by a cut keep a reader's pause"
 
 
+def test_a_long_first_word_timed_late_keeps_its_beginning():
+    log = TakeLog()
+    a = log.new_take(0, 1.0, "It's free."); a.end = 2.0; a.status = COMPLETE
+    a.words = [WordTiming(0, "It's", 1.1, 1.4), WordTiming(1, "free.", 1.5, 1.9)]
+    b = log.new_take(1, 2.9, "EventSourcingDB is the youngest."); b.end = 5.5; b.status = COMPLETE
+    # Whisper put "EventSourcingDB" 0.7 s after the reader began it.
+    b.words = [WordTiming(2, "EventSourcingDB", 3.9, 4.4), WordTiming(5, "youngest.", 4.9, 5.3)]
+    edit = auto_edit(log, 8.0, Rules(), quiet=_room([(1.1, 1.95), (3.2, 5.3)], 8.0))
+    first, second = sorted(edit.clips, key=lambda c: c.start)
+    assert 1.95 <= second.start <= 3.2 and first.end <= second.start
+
+
+def test_unheard_closing_words_after_a_label_stay_in_the_cut():
+    log = TakeLog()
+    a = log.new_take(0, 0.9, "SlateDB keeps one copy in a bucket: 1.6."); a.end = 2.8; a.status = COMPLETE
+    # Whisper heard nothing of "1.6", read after a pause.
+    a.words = [WordTiming(0, "SlateDB", 1.0, 1.5), WordTiming(6, "bucket:", 2.1, 2.5)]
+    b = log.new_take(1, 5.0, "And the Parquet archive: 1.1."); b.end = 7.0; b.status = COMPLETE
+    b.words = [WordTiming(8, "And", 5.1, 5.3), WordTiming(11, "1.1.", 6.2, 6.8)]
+    edit = auto_edit(log, 9.0, Rules(), quiet=_room([(1.0, 2.5), (3.0, 3.9), (5.1, 6.8)], 9.0))
+    first = min(edit.clips, key=lambda c: c.start)
+    assert 3.9 <= first.end <= 5.1
+
+
 def test_a_take_chosen_again_doesnt_overlap_a_neighbour_that_moved():
     log = TakeLog()
     a = log.new_take(0, 1.0, "first"); a.end = 3.0; a.status = COMPLETE
@@ -576,3 +600,11 @@ def test_a_take_chosen_again_doesnt_overlap_a_neighbour_that_moved():
     use_take(edit, log, a, Rules(), 10.0)
     clips = sorted(edit.clips, key=lambda c: c.start)
     assert all(left.end <= right.start + 1e-9 for left, right in zip(clips, clips[1:]))
+
+
+def test_cut_times_are_plain_floats_for_the_studio():
+    log = TakeLog()
+    a = log.new_take(0, 1.0, "first"); a.end = 3.0; a.status = COMPLETE
+    a.words = [WordTiming(0, "first", 1.1, 2.8)]
+    edit = auto_edit(log, 6.0, Rules(), quiet=_room([(1.2, 2.7)], 6.0))
+    assert all(type(c.start) is float and type(c.end) is float for c in edit.clips)

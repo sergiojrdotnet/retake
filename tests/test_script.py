@@ -126,3 +126,11 @@ def test_plain_text_scripts_have_no_markup_but_use_the_lexicon(tmp_path):
     assert script.sentences[0].tokens[0].text == "#" and script.sentences[0].tokens[0].kind == "text"
     tikv = next(w for w in script.words if w.display == "tikv")
     assert ["tie", "kay", "vee"] in tikv.variants
+
+
+def test_a_count_with_a_thousands_comma_is_read_in_hundreds_not_as_a_year():
+    from retake.script.normalize import word_variants
+
+    assert word_variants("1,210", "en")[0] == ["twelve", "hundred", "ten"]
+    assert ["twelve", "ten"] in word_variants("1,210", "en"), "still followed if read like a year"
+    assert word_variants("2026", "en")[0] == ["twenty", "twenty", "six"]

@@ -95,6 +95,9 @@ class Store:
             self.db.execute("DELETE FROM items")
             self.db.executemany("INSERT INTO items VALUES (?, ?, ?)", [(item["id"], position, _encode(item)) for position, item in enumerate(items)])
 
+    def save_value(self, key: str, value) -> None:
+        self._write("INSERT OR REPLACE INTO project VALUES (?, ?)", key, _encode(value))
+
     def log(self, item: str) -> dict | None:
         data = self._one("SELECT data FROM logs WHERE item = ?", item)
         return json.loads(data) if data else None

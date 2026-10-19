@@ -616,7 +616,9 @@ class Controller(QObject):
             self.notice.emit("error", f"Could not open the project: {error}")
             return
         self._open_project(project)
-        if len(project.items) == 1:
+        if project.last_opened:
+            self.openItem(*project.last_opened)
+        elif len(project.items) == 1:
             item = project.items[0]
             self.openItem(item.id, "studio" if item.parts else "prompter")
         elif project.items:
@@ -723,6 +725,8 @@ class Controller(QObject):
         self.editor.save()
         self.item = item
         self.itemChanged.emit()
+        if self.project is not None:
+            self.project.remember_opened(item.id, "prompter" if view == "prompter" else "studio")
         self._pickup = []
         self._review = {}
         self.coachChanged.emit()
@@ -1629,6 +1633,7 @@ class Controller(QObject):
             recorded = {t.sentence for t in added if t.status == COMPLETE and t.sentence is not None}
             self.item = item
             self.itemChanged.emit()
+            self.project.remember_opened(item.id, "studio")
             self._pickup = []
             self._review = {}
             self.coachChanged.emit()

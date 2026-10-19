@@ -223,6 +223,62 @@ def test_opening_words_the_sentence_says_again_later_are_no_restart():
     assert log.takes[0].start < 0.1
 
 
+def test_next_sentence_read_on_doesnt_lend_its_words_to_the_last_one():
+    script = parse("And one percent race another writer. Reads are about two per write: sixty from the last day.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    # Whisper missed "writer", so "write" of the next sentence could pass for it.
+    whisper(tracker, "and one percent race another reads are about two per write sixty from the last day", 0.0)
+    first, second = log.takes[0], log.takes[1]
+    assert first.status == COMPLETE and first.words[-1].text == "another"
+    assert second.sentence == 1 and abs(second.start - (1.5 - 0.15)) < 1e-6
+
+
+def test_a_number_later_in_the_sentence_that_sounds_like_its_opening_is_no_restart():
+    script = parse("About one billion events would take roughly 150 gigabytes; year ten, about 1.6 terabytes.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    # Whisper dropped "ten", as it did live.
+    whisper(tracker, "about one billion events would take roughly one hundred fifty gigabytes year about one point six terabytes", 0.0)
+    assert [take.status for take in log.takes] == [COMPLETE]
+
+
+def test_reading_the_next_sentence_moves_the_prompter_to_it():
+    script = parse("That's two to six times worse. If we relax the target, it handles more appends.", packs.get("en"))
+    log = TakeLog()
+    events = Recorder()
+    tracker = ScriptTracker(script, log, events, fillers=packs.get("en").fillers)
+    whisper(tracker, "if we relax the target it handles more appends", 0.0)
+    assert [(take.sentence, take.status) for take in log.takes] == [(1, COMPLETE)]
+
+
+def test_the_next_sentence_after_an_unheard_last_word_is_no_restart():
+    script = parse("On the side, an experiment loaded a hundred million events as jsonb. One of the extras comes back to that.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    # Whisper dropped "jsonb"; "One of the" sounds like "On the".
+    whisper(tracker, "on the side an experiment loaded a hundred million events as one of the extras comes back to that", 0.0)
+    assert [(take.sentence, take.status) for take in log.takes] == [(0, COMPLETE), (1, COMPLETE)]
+
+
+def test_opening_words_heard_apart_are_no_restart():
+    script = parse("The other 93 is storage, at the logical size.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    # "three" passes for "the", and "the" three words on for "other".
+    whisper(tracker, "the other ninety three is storage at the logical size", 0.0)
+    assert [take.status for take in log.takes] == [COMPLETE]
+    assert log.takes[0].start < 0.1
+
+
+def test_a_later_two_word_phrase_like_the_opening_is_no_restart():
+    script = parse("The two-instance version's capacity comes from the three-instance one, as we'll see.", packs.get("en"))
+    log = TakeLog()
+    tracker = ScriptTracker(script, log, Recorder(), fillers=packs.get("en").fillers)
+    whisper(tracker, "the two instance version's capacity comes from the three instance one as we'll see", 0.0)
+    assert [take.status for take in log.takes] == [COMPLETE]
+
+
 def test_dropped_opening_word_starts_the_take_where_speech_began():
     script, log, events, tracker = make_canary()
     tracker.go_to(2)

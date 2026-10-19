@@ -193,3 +193,17 @@ def test_removing_a_recording_closes_its_gap_and_keeps_the_rest(tmp_path):
     assert [(m.kind, m.start) for m in item.load_takes().markers] == [("mark", 13.0)]
     edit = item.load_edit()
     assert [(c.start, c.end) for c in edit.clips] == [(2.0, 3.0), (12.0, 13.0)] and edit.source_duration == 18.0
+
+
+def test_a_project_reopens_on_the_script_open_last(tmp_path):
+    project = projects.Project.create(tmp_path / "course", "Course")
+    for name in ("ep1", "ep2"):
+        source = tmp_path / f"{name}.md"
+        source.write_text(f"# {name}\n\nA sentence to read.\n")
+        project.add_script(source)
+    assert project.last_opened is None
+    project.remember_opened("ep2", "studio")
+    project.close()
+    again = projects.Project.load(project.path)
+    assert again.last_opened == ("ep2", "studio")
+    again.close()

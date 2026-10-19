@@ -60,7 +60,16 @@ def ordinal(n: int) -> list[str]:
     return words
 
 
-def number_variants(token: str) -> list[list[str]]:
+def _hundreds(value: int) -> list[str] | None:
+    """1,210 as "twelve hundred ten", the way a count of a thousand-odd is usually said."""
+    if not 1100 <= value <= 9999 or (value // 100) % 10 == 0:
+        return None
+    return cardinal(value // 100) + ["hundred"] + (cardinal(value % 100) if value % 100 else [])
+
+
+def number_variants(token: str, grouped: bool = False) -> list[list[str]]:
+    """The ways a number is said, the most natural first. `grouped`: written with a thousands comma,
+    so a count: "twelve hundred ten" for 1,210, not a year's "twelve ten" (still followed if said)."""
     match = _NUMBER.match(token.lower())
     if not match:
         return []
@@ -83,6 +92,13 @@ def number_variants(token: str) -> list[list[str]]:
         return [cardinal(value) + ["m"], cardinal(value) + ["million"]]
     variants = [cardinal(value)]
     as_year = year(value) if len(number) == 4 else None
+    if grouped:
+        hundreds = _hundreds(value)
+        if hundreds:
+            variants.insert(0, hundreds)
+        if as_year and as_year not in variants:
+            variants.append(as_year)
+        return variants
     if as_year and as_year != variants[0]:
         variants.insert(0, as_year)
     if len(number) > 1 and number.startswith("0"):
@@ -115,6 +131,7 @@ def simple_tokens(text: str) -> list[str]:
 
 
 def word_variants(display: str, numbers: str | None = "en", spoken: dict[str, list[list[str]]] | None = None) -> list[list[str]]:
+    grouped = {match.replace(",", "") for match in re.findall(r"\d{1,3}(?:,\d{3})+", unicodedata.normalize("NFKC", display))}
     original = clean(display).strip()
     tokens = simple_tokens(original)
     if not tokens:
@@ -127,7 +144,7 @@ def word_variants(display: str, numbers: str | None = "en", spoken: dict[str, li
             for alternative in spoken[token[:-2]]:
                 options.append(alternative[:-1] + [alternative[-1] + "'s"])
                 options.append(alternative + ["s"])
-        numeric = number_variants(token) if numbers == "en" else []
+        numeric = number_variants(token, grouped=token in grouped) if numbers == "en" else []
         options += numeric
         mixed = _MIXED.match(token) if numbers == "en" else None
         if mixed and not numeric:

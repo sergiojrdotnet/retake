@@ -189,7 +189,7 @@ Numbers, acronyms and units are matched the way people say them: `2026` matches 
 
 **Rehearsal** (`Shift+Space`) runs everything, coach included, without keeping anything.
 
-**Long scripts:** press `Space` to pause between scenes (paused parts are dropped by Auto edit), or stop and come back another day: opening the script again puts the prompter on the first sentence without a good take, and the next recording joins the same script. The studio's timeline is the script: every sentence in order, from whichever recording has its newest take.
+**Long scripts:** press `Space` to pause between scenes (paused parts are dropped by Auto edit), or stop and come back another day: the project reopens on the script you had open, the prompter on the first sentence without a good take, and the next recording joins the same script. The studio's timeline is the script: every sentence in order, from whichever recording has its newest take.
 
 **Pickups:** in the studio, select sentences (click a clip, Shift+click for a range, Ctrl+click to add) and press `R` or **Re-record**. The prompter walks through just those sentences; when the last one is done Retake returns to the studio with the new takes in place and the rest of your edit untouched.
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +99,44 @@ def phone_similarity(expected: list[str], heard: list[str]) -> float:
     return max(0.0, 1.0 - table[-1][-1] / max(len(expected), len(heard)))
 
 
+def in_context(alone: list[str], sentence: list[str]) -> list[str]:
+    """Each word's reading within the sentence (weak forms: "a" as ɐ), where it lines up with the word
+    read alone. espeak runs some words together ("in the" as ɪnðə) and splits others, so the sentence's
+    pieces can't be matched to words by position: a word whose piece doesn't line up keeps its own."""
+    from difflib import SequenceMatcher
+
+    def bare(text: str) -> str:
+        return "".join(ch for ch in text if ch not in _STRIP and ch != "\u200d")
+
+    def cost(a: str, b: str) -> float:
+        return 1.0 - SequenceMatcher(None, bare(a), bare(b)).ratio()
+
+    n, m = len(alone), len(sentence)
+    best = [[float("inf")] * (m + 1) for _ in range(n + 1)]
+    step: list[list[tuple[int, int] | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    best[0][0] = 0.0
+    for i in range(n + 1):
+        for j in range(m + 1):
+            if best[i][j] == float("inf"):
+                continue
+            for di, dj, extra in ((1, 1, 0.0), (2, 1, 0.1), (1, 2, 0.1), (1, 0, 1.0), (0, 1, 1.0)):
+                a, b = i + di, j + dj
+                if a > n or b > m:
+                    continue
+                c = best[i][j] + extra + (cost("".join(alone[i:a]), "".join(sentence[j:b])) if di and dj else 0.0)
+                if c < best[a][b]:
+                    best[a][b], step[a][b] = c, (di, dj)
+    result = list(alone)
+    i, j = n, m
+    while i or j:
+        di, dj = step[i][j]
+        # A short word's weak form ("to" as tə) shares little with its own reading but sits in its place.
+        if di == 1 and dj == 1 and (cost(alone[i - 1], sentence[j - 1]) <= 0.5 or len(bare(alone[i - 1])) <= 3):
+            result[i - 1] = sentence[j - 1]
+        i, j = i - di, j - dj
+    return result
+
+
 def tokenize_symbols(ipa: str, vocab: dict[str, int]) -> list[str]:
     inverse = {v: k for k, v in vocab.items()}
     return [inverse[i] for i in tokenize_ipa(ipa, vocab)]
@@ -173,6 +211,8 @@ class ExpectedWord:
     tokens: list[int]
     alternatives: list[list[str]]
     scored: bool
+    # Other readings the script allows ("1,210" as twelve ten), each (ipa, tokens).
+    readings: list[tuple[str, list[int]]] = field(default_factory=list)
 
 
 class PhonemeScorer:
@@ -208,10 +248,7 @@ class PhonemeScorer:
         self.last_seconds = 0.0
 
     def _phonemize(self, texts: list[str]) -> list[str]:
-        sentence = espeak.ipa(" ".join(texts), self.voice).split()
-        if len(sentence) == len(texts):
-            return sentence
-        return espeak.ipa_batch(texts, self.voice)
+        return in_context(espeak.ipa_batch(texts, self.voice), espeak.ipa(" ".join(texts), self.voice).split())
 
     def expected(self, words: list[dict]) -> list[ExpectedWord]:
         texts = [w["text"] for w in words]
@@ -227,9 +264,40 @@ class PhonemeScorer:
                     if alt not in alternatives:
                         alternatives.append(alt)
             scored = word["text"].lower() not in self.function_words
-            tokens = [self.canonical.get(self.vocab[part], self.vocab[part]) for part in english_units(symbols) if part in self.vocab]
-            result.append(ExpectedWord(word["text"], ipa, tokens, alternatives, scored))
+            readings = []
+            for reading in espeak.ipa_batch(word.get("say") or [], self.voice):
+                reading_symbols = tokenize_symbols(reading, self.vocab)
+                alternatives.append(decompose(reading_symbols))
+                readings.append((reading, self._tokens(reading_symbols)))
+            result.append(ExpectedWord(word["text"], ipa, self._tokens(symbols), alternatives, scored, readings))
         return result
+
+    def _tokens(self, symbols: list[str]) -> list[int]:
+        return [self.canonical.get(self.vocab[part], self.vocab[part]) for part in english_units(symbols) if part in self.vocab]
+
+    def _posterior(self, no_blank: np.ndarray, log_probs: np.ndarray, tokens: list[int]) -> float:
+        spans = ctc_align(log_probs, tokens, self.blank)
+        scores = [float(no_blank[a:b, token].mean()) if b > a else 0.0 for token, (a, b) in zip(tokens, spans)]
+        return 0.6 * float(np.mean(scores)) + 0.4 * float(np.min(scores)) if scores else 0.0
+
+    def _choose_readings(self, expected: list[ExpectedWord], log_probs: np.ndarray, no_blank: np.ndarray) -> None:
+        """A word the script lets be said several ways is scored as the reading that fits what was
+        said, judged in the stretch the first alignment gave it."""
+        spans = ctc_align(log_probs, [tok for word in expected for tok in word.tokens], self.blank)
+        bounds, cursor = [], 0
+        for word in expected:
+            mine = spans[cursor:cursor + len(word.tokens)]
+            cursor += len(word.tokens)
+            bounds.append((mine[0][0], mine[-1][1]) if mine else None)
+        for i, word in enumerate(expected):
+            if not word.readings or bounds[i] is None:
+                continue
+            low = next((b[1] for b in reversed(bounds[:i]) if b), 0)
+            high = next((b[0] for b in bounds[i + 1:] if b), len(log_probs))
+            if high - low < 2:
+                continue
+            options = [(word.ipa, word.tokens)] + word.readings
+            word.ipa, word.tokens = max(options, key=lambda o: self._posterior(no_blank[low:high], log_probs[low:high], o[1]) if o[1] else -1.0)
 
     def emissions(self, audio: np.ndarray) -> np.ndarray:
         torch = self.torch
@@ -249,12 +317,14 @@ class PhonemeScorer:
         started = time.perf_counter()
         expected = self.expected(words)
         log_probs = self.emissions(audio)
-        sequence = [tok for word in expected for tok in word.tokens]
-        spans = ctc_align(log_probs, sequence, self.blank)
         probabilities = np.exp(log_probs)
         no_blank = probabilities.copy()
         no_blank[:, self.blank] = 0
         no_blank /= no_blank.sum(axis=1, keepdims=True) + 1e-9
+        if any(word.readings for word in expected):
+            self._choose_readings(expected, log_probs, no_blank)
+        sequence = [tok for word in expected for tok in word.tokens]
+        spans = ctc_align(log_probs, sequence, self.blank)
         frame = self.model.frame_seconds
         results = []
         cursor = 0
